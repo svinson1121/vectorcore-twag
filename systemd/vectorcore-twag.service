@@ -1,0 +1,16 @@
+[Unit]
+Description=VectorCore TWAG
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/opt/vectorcore/twag/bin/twag -c /etc/vectorcore/twag/config.yaml
+Restart=on-failure
+RestartSec=5
+User=root
+Group=root
+LimitNOFILE=1048576
+
+[Install]
+WantedBy=multi-user.target
