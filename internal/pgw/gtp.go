@@ -14,7 +14,7 @@ type GTPClient struct {
 }
 
 func NewGTP(cfg config.PGWConfig, gtpCfg config.GTPConfig, log *slog.Logger) (*GTPClient, error) {
-	inner, err := gtp.NewGTP(cfg, gtpCfg.Echo, log)
+	inner, err := gtp.NewGTP(cfg, gtpCfg.ControlEcho, log)
 	if err != nil {
 		return nil, err
 	}

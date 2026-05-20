@@ -21,8 +21,28 @@ import (
 )
 
 const (
-	ModeKernelGTP = "kernel_gtp"
+	ModeKernelGTP             = "kernel_gtp"
+	gtpUEchoModeKernelNetlink = "kernel_netlink"
+	gtpUEchoModeKernelSocket  = "kernel_registered_socket"
+	genlGTPCmdEchoReq         = 3
+	gtpUPort                  = 2152
 )
+
+type userEchoObservation struct {
+	Peer     *net.UDPAddr
+	Sequence uint16
+	At       time.Time
+}
+
+type UserEchoHealthStatus struct {
+	Health              string
+	ConsecutiveFailures int
+	LastSuccess         time.Time
+	LastFailure         time.Time
+	LastLatency         time.Duration
+	KernelSupported     bool
+	Mode                string
+}
 
 type UserPlane interface {
 	Start(ctx context.Context) error
@@ -30,6 +50,8 @@ type UserPlane interface {
 	SetErrorIndicationHandler(handler gtpu.ErrorIndicationHandler)
 	AddSession(ctx context.Context, sess *session.Session) error
 	RemoveSession(ctx context.Context, sess *session.Session) error
+	ProbeUserEcho(ctx context.Context) error
+	StartUserEchoWatchdog(ctx context.Context)
 	Type() string
 }
 
@@ -43,6 +65,7 @@ func New(cfg config.Config, log *slog.Logger) (UserPlane, error) {
 type KernelGTP struct {
 	cfg          config.UserPlaneConfig
 	pgw          config.PGWConfig
+	userEchoCfg  config.GTPUserEchoConfig
 	routing      config.RoutingConfig
 	log          *slog.Logger
 	link         netlink.Link
@@ -57,10 +80,25 @@ type KernelGTP struct {
 	ctx          context.Context
 	cancel       context.CancelFunc
 	readWG       sync.WaitGroup
+	echoWG       sync.WaitGroup
+	echoMu       sync.Mutex
+	echoPending  chan userEchoObservation
+	echoSequence uint16
+	echoStarted  bool
+
+	healthMu                sync.RWMutex
+	gtpuHealth              string
+	gtpuEchoSupported       bool
+	gtpuEchoDisabled        bool
+	gtpuEchoDisableReason   string
+	consecutiveEchoFailures int
+	lastEchoSuccess         time.Time
+	lastEchoFailure         time.Time
+	lastEchoLatency         time.Duration
 }
 
 func NewKernelGTP(cfg config.UserPlaneConfig, pgw config.PGWConfig, routing config.RoutingConfig, log *slog.Logger) *KernelGTP {
-	return &KernelGTP{cfg: cfg, pgw: pgw, routing: routing, log: log}
+	return &KernelGTP{cfg: cfg, pgw: pgw, userEchoCfg: pgw.UserEcho, routing: routing, log: log, gtpuHealth: "unknown"}
 }
 
 func (k *KernelGTP) Start(ctx context.Context) error {
@@ -96,6 +134,9 @@ func (k *KernelGTP) Start(ctx context.Context) error {
 		"remote_pgw_gtpu_ip", k.pgw.RemotePGWGTPUIP,
 		"created", true,
 	)
+	if err := k.detectUserEchoSupport(); err != nil {
+		return err
+	}
 	k.ctx, k.cancel = context.WithCancel(ctx)
 	k.readWG.Add(1)
 	go func() {
@@ -113,6 +154,7 @@ func (k *KernelGTP) Stop() error {
 	}
 	k.wakeControlReader()
 	k.readWG.Wait()
+	k.echoWG.Wait()
 	if k.created && k.link != nil {
 		if err := k.handle.LinkDel(k.link); err != nil && !isNotFound(err) {
 			errs = append(errs, err)
@@ -286,6 +328,365 @@ func (k *KernelGTP) SetErrorIndicationHandler(handler gtpu.ErrorIndicationHandle
 	k.errorHandler = handler
 }
 
+func (k *KernelGTP) ProbeUserEcho(ctx context.Context) error {
+	if !k.userEchoCfg.Enabled || k.gtpuEchoDisabled {
+		return nil
+	}
+	if !k.gtpuEchoSupported {
+		return fmt.Errorf("kernel GTP-U Echo support unavailable")
+	}
+	return k.runUserEchoProbe(ctx)
+}
+
+func (k *KernelGTP) UserEchoHealth() UserEchoHealthStatus {
+	k.healthMu.RLock()
+	defer k.healthMu.RUnlock()
+	return UserEchoHealthStatus{
+		Health:              k.gtpuHealth,
+		ConsecutiveFailures: k.consecutiveEchoFailures,
+		LastSuccess:         k.lastEchoSuccess,
+		LastFailure:         k.lastEchoFailure,
+		LastLatency:         k.lastEchoLatency,
+		KernelSupported:     k.gtpuEchoSupported,
+		Mode:                k.userEchoCfg.Mode,
+	}
+}
+
+func (k *KernelGTP) StartUserEchoWatchdog(ctx context.Context) {
+	if !k.userEchoCfg.Enabled || k.gtpuEchoDisabled || !k.gtpuEchoSupported {
+		return
+	}
+	k.echoMu.Lock()
+	if k.echoStarted {
+		k.echoMu.Unlock()
+		return
+	}
+	k.echoStarted = true
+	k.echoMu.Unlock()
+	k.echoWG.Add(1)
+	go func() {
+		defer k.echoWG.Done()
+		k.runUserEchoWatchdog(ctx)
+	}()
+}
+
+func (k *KernelGTP) detectUserEchoSupport() error {
+	if !k.userEchoCfg.Enabled {
+		return nil
+	}
+	if k.userEchoCfg.Mode != gtpUEchoModeKernelNetlink {
+		return fmt.Errorf("unsupported GTP-U echo mode %q", k.userEchoCfg.Mode)
+	}
+	supported := kernelGTPHeaderHasEchoReq()
+	if supported && k.handle != nil {
+		if _, err := k.handle.GenlFamilyGet(nl.GENL_GTP_NAME); err != nil {
+			supported = false
+		}
+	}
+	if !supported {
+		k.gtpuEchoSupported = false
+		k.gtpuEchoDisabled = true
+		k.gtpuEchoDisableReason = "GTP_CMD_ECHOREQ not supported by running kernel"
+		k.log.Warn("GTP-U echo kernel support unavailable",
+			"mode", k.userEchoCfg.Mode,
+			"user_echo_enabled", false,
+			"reason", k.gtpuEchoDisableReason,
+		)
+		if k.userEchoCfg.RequireKernelSupport {
+			return fmt.Errorf("GTP-U echo kernel support unavailable: %s", k.gtpuEchoDisableReason)
+		}
+		return nil
+	}
+	k.gtpuEchoSupported = true
+	k.log.Info("GTP-U echo kernel support detected",
+		"mode", k.userEchoCfg.Mode,
+		"gtp_cmd_echoreq", true,
+		"kernel_interface", k.cfg.GTPInterface,
+	)
+	return nil
+}
+
+func (k *KernelGTP) runUserEchoWatchdog(ctx context.Context) {
+	interval := time.Duration(k.userEchoCfg.IntervalSeconds) * time.Second
+	timeout := time.Duration(k.userEchoCfg.TimeoutSeconds) * time.Second
+	k.log.Info("GTP-U echo watchdog started",
+		"mode", k.userEchoCfg.Mode,
+		"remote_pgw_gtpu_ip", k.pgw.RemotePGWGTPUIP,
+		"remote_pgw_gtpu_port", gtpUPort,
+		"interval_seconds", k.userEchoCfg.IntervalSeconds,
+		"timeout_seconds", k.userEchoCfg.TimeoutSeconds,
+		"max_failures", k.userEchoCfg.MaxFailures,
+	)
+	defer func() {
+		k.echoMu.Lock()
+		k.echoStarted = false
+		k.echoMu.Unlock()
+		k.log.Info("GTP-U echo watchdog stopped",
+			"mode", k.userEchoCfg.Mode,
+			"remote_pgw_gtpu_ip", k.pgw.RemotePGWGTPUIP,
+			"remote_pgw_gtpu_port", gtpUPort,
+		)
+	}()
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-k.ctx.Done():
+			return
+		case <-ticker.C:
+			if k.userEchoUnavailable() {
+				return
+			}
+			probeCtx, cancel := context.WithTimeout(ctx, timeout)
+			_ = k.runUserEchoProbe(probeCtx)
+			cancel()
+		}
+	}
+}
+
+func (k *KernelGTP) runUserEchoProbe(ctx context.Context) error {
+	pending := k.ensureUserEchoPending()
+	defer k.clearUserEchoPending(pending)
+	sequence, mode, err := k.triggerUserEchoRequest()
+	if err != nil {
+		if k.disableUserEchoOnKernelReject(err) {
+			return nil
+		}
+		failures, unhealthy := k.recordUserEchoFailure(err)
+		k.log.Warn("GTP-U echo failed",
+			"gtpu_peer_health", k.UserEchoHealth().Health,
+			"remote_pgw_gtpu_ip", k.pgw.RemotePGWGTPUIP,
+			"error", err,
+			"consecutive_failures", failures,
+			"max_failures", k.userEchoCfg.MaxFailures,
+		)
+		if unhealthy {
+			k.log.Warn("GTP-U peer marked unhealthy",
+				"gtpu_peer_health", "unhealthy",
+				"remote_pgw_gtpu_ip", k.pgw.RemotePGWGTPUIP,
+				"consecutive_failures", failures,
+			)
+		}
+		return err
+	}
+	start := time.Now()
+	k.log.Info("GTP-U echo request triggered",
+		"mode", mode,
+		"kernel_interface", k.cfg.GTPInterface,
+		"local_gtpu_ip", k.pgw.LocalGTPUIP,
+		"remote_pgw_gtpu_ip", k.pgw.RemotePGWGTPUIP,
+		"sequence", sequence,
+	)
+	select {
+	case obs := <-pending:
+		latency := obs.At.Sub(start)
+		k.recordUserEchoSuccess(latency)
+		k.log.Info("GTP-U echo response observed",
+			"mode", k.userEchoCfg.Mode,
+			"gtpu_peer_health", k.UserEchoHealth().Health,
+			"remote_pgw_gtpu_ip", obs.Peer.IP.String(),
+			"sequence", obs.Sequence,
+			"latency_ms", latency.Milliseconds(),
+			"consecutive_failures", 0,
+		)
+		return nil
+	case <-ctx.Done():
+		err := ctx.Err()
+		failures, unhealthy := k.recordUserEchoFailure(err)
+		k.log.Warn("GTP-U echo failed",
+			"gtpu_peer_health", k.UserEchoHealth().Health,
+			"remote_pgw_gtpu_ip", k.pgw.RemotePGWGTPUIP,
+			"error", err,
+			"consecutive_failures", failures,
+			"max_failures", k.userEchoCfg.MaxFailures,
+		)
+		if unhealthy {
+			k.log.Warn("GTP-U peer marked unhealthy",
+				"gtpu_peer_health", "unhealthy",
+				"remote_pgw_gtpu_ip", k.pgw.RemotePGWGTPUIP,
+				"consecutive_failures", failures,
+			)
+		}
+		return err
+	}
+}
+
+func (k *KernelGTP) clearUserEchoPending(ch chan userEchoObservation) {
+	k.echoMu.Lock()
+	defer k.echoMu.Unlock()
+	if k.echoPending == ch {
+		k.echoPending = nil
+	}
+}
+
+func (k *KernelGTP) ensureUserEchoPending() chan userEchoObservation {
+	k.echoMu.Lock()
+	defer k.echoMu.Unlock()
+	k.echoPending = make(chan userEchoObservation, 1)
+	return k.echoPending
+}
+
+func (k *KernelGTP) observeUserEchoResponse(peer *net.UDPAddr, sequence uint16) {
+	if peer == nil {
+		return
+	}
+	expected := net.ParseIP(k.pgw.RemotePGWGTPUIP)
+	if expected != nil && !peer.IP.Equal(expected) {
+		k.log.Warn("GTP-U echo response from unexpected peer ignored",
+			"remote_ip", peer.IP.String(),
+			"remote_port", peer.Port,
+			"expected_remote_ip", expected.String(),
+			"sequence", sequence,
+		)
+		return
+	}
+	k.echoMu.Lock()
+	pending := k.echoPending
+	k.echoMu.Unlock()
+	if pending == nil {
+		k.log.Info("GTP-U echo response observed",
+			"mode", k.userEchoCfg.Mode,
+			"remote_pgw_gtpu_ip", peer.IP.String(),
+			"sequence", sequence,
+			"latency_ms", 0,
+			"consecutive_failures", 0,
+		)
+		return
+	}
+	select {
+	case pending <- userEchoObservation{Peer: peer, Sequence: sequence, At: time.Now()}:
+	default:
+	}
+}
+
+func (k *KernelGTP) triggerUserEchoRequest() (uint16, string, error) {
+	if err := k.triggerUserEchoRequestNetlink(); err == nil {
+		return 0, k.userEchoCfg.Mode, nil
+	} else if !isKernelEchoUnsupportedError(err) {
+		return 0, k.userEchoCfg.Mode, err
+	}
+	sequence, err := k.triggerUserEchoRequestSocket()
+	return sequence, gtpUEchoModeKernelSocket, err
+}
+
+func (k *KernelGTP) triggerUserEchoRequestNetlink() error {
+	if k.handle == nil {
+		return fmt.Errorf("kernel GTP netlink handle is not open")
+	}
+	link, err := k.currentLink()
+	if err != nil {
+		return err
+	}
+	f, err := k.handle.GenlFamilyGet(nl.GENL_GTP_NAME)
+	if err != nil {
+		return fmt.Errorf("lookup GTP generic netlink family: %w", err)
+	}
+	peer := net.ParseIP(k.pgw.RemotePGWGTPUIP)
+	if peer == nil || peer.To4() == nil {
+		return fmt.Errorf("remote PGW GTP-U IP is invalid")
+	}
+	local := net.ParseIP(k.pgw.LocalGTPUIP)
+	if local == nil || local.To4() == nil {
+		return fmt.Errorf("local GTP-U IP is invalid")
+	}
+	msg := &nl.Genlmsg{Command: genlGTPCmdEchoReq, Version: nl.GENL_GTP_VERSION}
+	req := nl.NewNetlinkRequest(int(f.ID), unix.NLM_F_ACK)
+	req.AddData(msg)
+	req.AddData(nl.NewRtAttr(nl.GENL_GTP_ATTR_VERSION, nl.Uint32Attr(1)))
+	req.AddData(nl.NewRtAttr(nl.GENL_GTP_ATTR_NET_NS_FD, nl.Uint32Attr(uint32(fdValue(k.nsFile)))))
+	req.AddData(nl.NewRtAttr(nl.GENL_GTP_ATTR_LINK, nl.Uint32Attr(uint32(link.Attrs().Index))))
+	req.AddData(nl.NewRtAttr(nl.GENL_GTP_ATTR_PEER_ADDRESS, []byte(peer.To4())))
+	req.AddData(nl.NewRtAttr(nl.GENL_GTP_ATTR_MS_ADDRESS, []byte(local.To4())))
+	_, err = req.Execute(unix.NETLINK_GENERIC, 0)
+	if err != nil {
+		return fmt.Errorf("trigger kernel GTP-U Echo Request: %w", err)
+	}
+	return nil
+}
+
+func (k *KernelGTP) triggerUserEchoRequestSocket() (uint16, error) {
+	if k.gtp1 == nil {
+		return 0, fmt.Errorf("kernel-associated GTP-U socket is not open")
+	}
+	peer := net.ParseIP(k.pgw.RemotePGWGTPUIP)
+	if peer == nil || peer.To4() == nil {
+		return 0, fmt.Errorf("remote PGW GTP-U IP is invalid")
+	}
+	sequence := k.nextUserEchoSequence()
+	packet, err := gtpu.EncodeEchoRequest(sequence)
+	if err != nil {
+		return 0, err
+	}
+	remote := &net.UDPAddr{IP: peer, Port: gtpUPort}
+	if _, err := k.gtp1.WriteToUDP(packet, remote); err != nil {
+		return 0, fmt.Errorf("send GTP-U Echo Request on kernel-associated socket: %w", err)
+	}
+	return sequence, nil
+}
+
+func (k *KernelGTP) nextUserEchoSequence() uint16 {
+	k.echoMu.Lock()
+	defer k.echoMu.Unlock()
+	k.echoSequence++
+	if k.echoSequence == 0 {
+		k.echoSequence = 1
+	}
+	return k.echoSequence
+}
+
+func (k *KernelGTP) recordUserEchoSuccess(latency time.Duration) {
+	k.healthMu.Lock()
+	defer k.healthMu.Unlock()
+	k.gtpuHealth = "healthy"
+	k.consecutiveEchoFailures = 0
+	k.lastEchoSuccess = time.Now()
+	k.lastEchoLatency = latency
+}
+
+func (k *KernelGTP) recordUserEchoFailure(err error) (int, bool) {
+	k.healthMu.Lock()
+	defer k.healthMu.Unlock()
+	k.consecutiveEchoFailures++
+	k.lastEchoFailure = time.Now()
+	if k.consecutiveEchoFailures >= k.userEchoCfg.MaxFailures && k.gtpuHealth != "unhealthy" {
+		k.gtpuHealth = "unhealthy"
+		return k.consecutiveEchoFailures, true
+	}
+	return k.consecutiveEchoFailures, false
+}
+
+func (k *KernelGTP) disableUserEchoOnKernelReject(err error) bool {
+	if k.userEchoCfg.RequireKernelSupport || !isKernelEchoUnsupportedError(err) {
+		return false
+	}
+	k.echoMu.Lock()
+	k.gtpuEchoDisabled = true
+	k.gtpuEchoSupported = false
+	k.gtpuEchoDisableReason = err.Error()
+	k.echoMu.Unlock()
+	k.log.Warn("GTP-U echo kernel support unavailable",
+		"mode", k.userEchoCfg.Mode,
+		"user_echo_enabled", false,
+		"reason", err.Error(),
+	)
+	return true
+}
+
+func (k *KernelGTP) userEchoUnavailable() bool {
+	k.echoMu.Lock()
+	defer k.echoMu.Unlock()
+	return k.gtpuEchoDisabled || !k.gtpuEchoSupported
+}
+
+func isKernelEchoUnsupportedError(err error) bool {
+	return errors.Is(err, unix.EINVAL) ||
+		errors.Is(err, unix.EOPNOTSUPP) ||
+		errors.Is(err, unix.ENODEV) ||
+		errors.Is(err, unix.ENETDOWN)
+}
+
 func (k *KernelGTP) readControlLoop(ctx context.Context) {
 	if k.gtp1 == nil {
 		return
@@ -324,6 +725,8 @@ func (k *KernelGTP) readControlLoop(ctx context.Context) {
 				continue
 			}
 			k.log.Info("GTP-U echo response sent", "remote_ip", peer.IP.String(), "remote_port", peer.Port, "sequence", msg.Sequence)
+		case 2:
+			k.observeUserEchoResponse(peer, msg.Sequence)
 		case 26:
 			ind := gtpu.ErrorIndication{RemoteAddr: peer, OffendingTEID: msg.OffendingTEID, RawPayload: append([]byte(nil), msg.Payload...)}
 			k.log.Warn("GTP-U Error Indication received",
@@ -573,6 +976,16 @@ func hostNet(ip net.IP) *net.IPNet {
 
 func defaultIPv4Net() *net.IPNet {
 	return &net.IPNet{IP: net.IPv4zero, Mask: net.CIDRMask(0, 32)}
+}
+
+func kernelGTPHeaderHasEchoReq() bool {
+	for _, path := range []string{"/usr/include/linux/gtp.h"} {
+		b, err := os.ReadFile(path)
+		if err == nil && strings.Contains(string(b), "GTP_CMD_ECHOREQ") {
+			return true
+		}
+	}
+	return false
 }
 
 func firstIP(values ...net.IP) net.IP {

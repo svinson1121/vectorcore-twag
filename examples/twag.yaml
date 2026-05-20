@@ -57,12 +57,20 @@ gtp:
   charging_characteristics: "0800"
   kernel_interface: gtp0
 
-  echo:
+  control_echo:
     enabled: true
     interval_seconds: 30
     timeout_seconds: 5
     max_failures: 3
     startup_probe: true
+  user_echo:
+    enabled: true
+    mode: kernel_netlink
+    interval_seconds: 30
+    timeout_seconds: 5
+    max_failures: 3
+    startup_probe: true
+    require_kernel_support: false
 
 session_recovery:
   enabled: true

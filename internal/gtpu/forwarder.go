@@ -354,6 +354,18 @@ func EncodeEchoResponse(sequence uint16) ([]byte, error) {
 	return out, nil
 }
 
+func EncodeEchoRequest(sequence uint16) ([]byte, error) {
+	out := make([]byte, headerLenGTPUWithSequence)
+	out[0] = 0x32
+	out[1] = msgTypeEchoRequest
+	binary.BigEndian.PutUint16(out[2:4], 4)
+	binary.BigEndian.PutUint32(out[4:8], 0)
+	binary.BigEndian.PutUint16(out[8:10], sequence)
+	out[10] = 0
+	out[11] = 0
+	return out, nil
+}
+
 func parseOffendingTEID(payload []byte) uint32 {
 	for i := 0; i+2 <= len(payload); {
 		typ := payload[i]

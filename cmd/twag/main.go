@@ -103,8 +103,8 @@ func run(cfg *config.Config, log *slog.Logger) error {
 	if err != nil {
 		return err
 	}
-	if cfg.GTP.Echo.StartupProbe {
-		probeCtx, probeCancel := context.WithTimeout(ctx, time.Duration(cfg.GTP.Echo.TimeoutSeconds)*time.Second)
+	if cfg.GTP.ControlEcho.StartupProbe {
+		probeCtx, probeCancel := context.WithTimeout(ctx, time.Duration(cfg.GTP.ControlEcho.TimeoutSeconds)*time.Second)
 		if err := pgwClient.Probe(probeCtx); err != nil {
 			probeCancel()
 			return fmt.Errorf("pgw probe failed: %w", err)
@@ -138,6 +138,15 @@ func run(cfg *config.Config, log *slog.Logger) error {
 	if err := userPlane.Start(ctx); err != nil {
 		return err
 	}
+	if cfg.GTP.UserEcho.Enabled && cfg.GTP.UserEcho.StartupProbe {
+		probeCtx, probeCancel := context.WithTimeout(ctx, time.Duration(cfg.GTP.UserEcho.TimeoutSeconds)*time.Second)
+		if err := userPlane.ProbeUserEcho(probeCtx); err != nil {
+			probeCancel()
+			return fmt.Errorf("GTP-U echo startup probe failed: %w", err)
+		}
+		probeCancel()
+	}
+	userPlane.StartUserEchoWatchdog(ctx)
 	if err := accessSide.Start(ctx); err != nil {
 		return err
 	}

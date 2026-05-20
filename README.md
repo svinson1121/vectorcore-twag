@@ -34,7 +34,7 @@ Currently implemented or being validated:
 
 Items still being hardened:
 
-- GTP-U Echo support through Linux kernel GTP generic netlink where supported
+- GTP-U Echo support through Linux kernel GTP generic netlink where supported, with safe fallback to the kernel-registered GTP-U socket
 - Post-activation user-plane health checks
 - Broader AP compatibility testing
 - Long-duration stability testing
@@ -143,6 +143,8 @@ GTP-U is handled through Linux kernel GTP. TWAG programs PDP/session state into 
 
 TWAG must not create a competing userspace UDP/2152 socket that fights the kernel GTP datapath.
 
+For GTP-U Echo, TWAG first tries the kernel GTP generic netlink `GTP_CMD_ECHOREQ` path. Some kernels expose the command but reject it for GTP devices created with userspace-supplied UDP file descriptors. In that case TWAG sends Echo Requests using the same UDP/2152 socket already registered with the kernel GTP device. This is not a second listener and does not take G-PDUs away from the kernel datapath.
+
 ### DHCP and ARP
 
 The PGW assigns the subscriber IP, but the Wi-Fi UE expects normal DHCP and ARP behavior.
@@ -221,12 +223,20 @@ gtp:
   charging_characteristics: "0800"
   kernel_interface: gtp0
 
-  echo:
+  control_echo:
     enabled: true
     interval_seconds: 30
     timeout_seconds: 5
     max_failures: 3
     startup_probe: true
+  user_echo:
+    enabled: true
+    mode: kernel_netlink
+    interval_seconds: 30
+    timeout_seconds: 5
+    max_failures: 3
+    startup_probe: true
+    require_kernel_support: false
 
 session_recovery:
   enabled: true
@@ -423,16 +433,37 @@ GTP-C echo response sent
 
 GTP-U uses the Linux kernel GTP datapath.
 
-Modern Linux kernels may support GTP-U Echo through the kernel GTP generic netlink API.
+Modern Linux kernels may support GTP-U Echo through the kernel GTP generic netlink API. TWAG configures this with `gtp.user_echo.mode: kernel_netlink` and never opens a second competing UDP/2152 socket for echo.
+
+Runtime behavior:
+
+```text
+try GTP_CMD_ECHOREQ through kernel generic netlink
+if the kernel accepts it, the packet is sent by the kernel GTP path
+if the kernel rejects it as unsupported for this GTP device, use the UDP/2152 socket already registered with gtp.ko
+observe Echo Response on the existing GTP-U control read path
+do not consume G-PDUs in userspace
+```
+
+The fallback runtime log uses:
+
+```text
+mode="kernel_registered_socket"
+```
+
+That means TWAG is using the same socket/Fd registered with the Linux GTP device, not a new UDP listener.
 
 TWAG should:
 
 ```text
 detect kernel GTP-U Echo support
-trigger GTP-U Echo Request through kernel netlink when supported
-observe Echo Response through kernel notification when supported
+trigger GTP-U Echo Request through kernel netlink when supported by the active device
+fall back to the existing kernel-registered UDP/2152 socket when netlink echo is unavailable
+observe Echo Response through the existing GTP-U control path
 avoid creating a competing UDP/2152 userspace socket
 ```
+
+If all supported GTP-U Echo paths are unavailable and `require_kernel_support` is false, TWAG disables `user_echo` and continues to rely on GTP-U Error Indication handling. If `require_kernel_support` is true, startup fails when GTP-U Echo cannot be enabled.
 
 Useful checks:
 
@@ -567,6 +598,13 @@ Echo Response
 
 ```bash
 tcpdump -ni any -s 0 -w /tmp/twag-gtpu.pcap 'udp port 2152'
+```
+
+Expected Echo packets when `gtp.user_echo.enabled: true`:
+
+```text
+TWAG -> PGW GTP-U Echo Request, TEID 0
+PGW  -> TWAG GTP-U Echo Response, TEID 0
 ```
 
 Useful tshark:
@@ -708,7 +746,7 @@ tcpdump -ni any -w /tmp/gtpu.pcap 'udp port 2152'
 
 Do not create a second userspace UDP/2152 listener competing with Linux kernel GTP.
 
-Use kernel GTP netlink support where available.
+Use kernel GTP netlink support where available. If the running kernel rejects `GTP_CMD_ECHOREQ` for the active GTP device, use only the UDP/2152 socket already registered with the kernel GTP device.
 
 ### Cleanup must be idempotent
 

@@ -119,14 +119,39 @@ type IPAMConfig struct {
 }
 
 type GTPConfig struct {
-	LocalGTPCIP             string        `yaml:"local_gtpc_ip"`
-	LocalGTPUIP             string        `yaml:"local_gtpu_ip"`
-	RemotePGWGTPCIP         string        `yaml:"remote_pgw_gtpc_ip"`
-	RemotePGWGTPUIP         string        `yaml:"remote_pgw_gtpu_ip"`
-	APN                     string        `yaml:"apn"`
-	ChargingCharacteristics string        `yaml:"charging_characteristics"`
-	KernelInterface         string        `yaml:"kernel_interface"`
-	Echo                    GTPEchoConfig `yaml:"echo"`
+	LocalGTPCIP             string            `yaml:"local_gtpc_ip"`
+	LocalGTPUIP             string            `yaml:"local_gtpu_ip"`
+	RemotePGWGTPCIP         string            `yaml:"remote_pgw_gtpc_ip"`
+	RemotePGWGTPUIP         string            `yaml:"remote_pgw_gtpu_ip"`
+	APN                     string            `yaml:"apn"`
+	ChargingCharacteristics string            `yaml:"charging_characteristics"`
+	KernelInterface         string            `yaml:"kernel_interface"`
+	Echo                    GTPEchoConfig     `yaml:"echo"`
+	ControlEcho             GTPEchoConfig     `yaml:"control_echo"`
+	UserEcho                GTPUserEchoConfig `yaml:"user_echo"`
+	legacyEchoSet           bool
+	controlEchoSet          bool
+	userEchoSet             bool
+}
+
+func (g *GTPConfig) UnmarshalYAML(value *yaml.Node) error {
+	type plain GTPConfig
+	var decoded plain = plain(*g)
+	if err := value.Decode(&decoded); err != nil {
+		return err
+	}
+	*g = GTPConfig(decoded)
+	for i := 0; i+1 < len(value.Content); i += 2 {
+		switch value.Content[i].Value {
+		case "echo":
+			g.legacyEchoSet = true
+		case "control_echo":
+			g.controlEchoSet = true
+		case "user_echo":
+			g.userEchoSet = true
+		}
+	}
+	return nil
 }
 
 type PGWConfig = GTPConfig
@@ -137,6 +162,16 @@ type GTPEchoConfig struct {
 	TimeoutSeconds  int  `yaml:"timeout_seconds"`
 	MaxFailures     int  `yaml:"max_failures"`
 	StartupProbe    bool `yaml:"startup_probe"`
+}
+
+type GTPUserEchoConfig struct {
+	Enabled              bool   `yaml:"enabled"`
+	Mode                 string `yaml:"mode"`
+	IntervalSeconds      int    `yaml:"interval_seconds"`
+	TimeoutSeconds       int    `yaml:"timeout_seconds"`
+	MaxFailures          int    `yaml:"max_failures"`
+	StartupProbe         bool   `yaml:"startup_probe"`
+	RequireKernelSupport bool   `yaml:"require_kernel_support"`
 }
 
 type RecoveryConfig struct {
@@ -229,7 +264,7 @@ func Default() *Config {
 				AuthApplicationID: STaAuthApplicationID,
 			},
 		},
-		GTP:       GTPConfig{ChargingCharacteristics: "0800", KernelInterface: "gtp0", Echo: GTPEchoConfig{Enabled: true, IntervalSeconds: 30, TimeoutSeconds: 5, MaxFailures: 3, StartupProbe: true}},
+		GTP:       GTPConfig{ChargingCharacteristics: "0800", KernelInterface: "gtp0", ControlEcho: GTPEchoConfig{Enabled: true, IntervalSeconds: 30, TimeoutSeconds: 5, MaxFailures: 3, StartupProbe: true}, UserEcho: GTPUserEchoConfig{Mode: "kernel_netlink", IntervalSeconds: 30, TimeoutSeconds: 5, MaxFailures: 3}},
 		Recovery:  RecoveryConfig{Enabled: true, ReasonGTPUError: true, RecoveryWindowSeconds: 60, StaleClientGraceSeconds: 10, CleanupOnDuplicateAttach: true, AllowSameMACReattach: true, RejectOldDHCPIP: true, DHCPStaleRequestAction: "nak", RadiusDisconnect: RadiusDisconnectConfig{NASPort: 3799, TimeoutSeconds: 3, Retries: 2, RequestType: "disconnect", FallbackToRecoveryTombstone: true}},
 		Lifecycle: LifecycleConfig{DuplicateAttachPolicy: "reuse_existing", DuplicateAttachCleanupTimeoutSeconds: 5, SuppressDuplicateCreateSession: true, PerSubscriberLockTimeoutSeconds: 10},
 		Routing:   RoutingConfig{InstallRoutes: true},
@@ -286,14 +321,14 @@ func (c *Config) ApplyDefaults() {
 	if c.GTP.KernelInterface == "" {
 		c.GTP.KernelInterface = "gtp0"
 	}
-	if c.GTP.Echo.IntervalSeconds == 0 {
-		c.GTP.Echo.IntervalSeconds = 30
+	if c.GTP.legacyEchoSet && !c.GTP.controlEchoSet {
+		c.GTP.ControlEcho = c.GTP.Echo
 	}
-	if c.GTP.Echo.TimeoutSeconds == 0 {
-		c.GTP.Echo.TimeoutSeconds = 5
-	}
-	if c.GTP.Echo.MaxFailures == 0 {
-		c.GTP.Echo.MaxFailures = 3
+	c.GTP.ControlEcho = normalizeGTPEchoConfig(c.GTP.ControlEcho)
+	c.GTP.Echo = c.GTP.ControlEcho
+	c.GTP.UserEcho = normalizeGTPUserEchoConfig(c.GTP.UserEcho)
+	if c.GTP.UserEcho.Enabled && c.GTP.UserEcho.TimeoutSeconds >= c.GTP.UserEcho.IntervalSeconds {
+		fmt.Fprintf(os.Stderr, "VectorCore TWAG: warning: gtp.user_echo.timeout_seconds should be less than interval_seconds\n")
 	}
 	if c.Recovery.RecoveryWindowSeconds == 0 {
 		c.Recovery.RecoveryWindowSeconds = 60
@@ -341,6 +376,35 @@ func (c *Config) ApplyDefaults() {
 	}
 	c.AAA.STa.VendorID = STaVendorID
 	c.AAA.STa.AuthApplicationID = STaAuthApplicationID
+}
+
+func normalizeGTPEchoConfig(cfg GTPEchoConfig) GTPEchoConfig {
+	if cfg.IntervalSeconds == 0 {
+		cfg.IntervalSeconds = 30
+	}
+	if cfg.TimeoutSeconds == 0 {
+		cfg.TimeoutSeconds = 5
+	}
+	if cfg.MaxFailures == 0 {
+		cfg.MaxFailures = 3
+	}
+	return cfg
+}
+
+func normalizeGTPUserEchoConfig(cfg GTPUserEchoConfig) GTPUserEchoConfig {
+	if cfg.Mode == "" {
+		cfg.Mode = "kernel_netlink"
+	}
+	if cfg.IntervalSeconds == 0 {
+		cfg.IntervalSeconds = 30
+	}
+	if cfg.TimeoutSeconds == 0 {
+		cfg.TimeoutSeconds = 5
+	}
+	if cfg.MaxFailures == 0 {
+		cfg.MaxFailures = 3
+	}
+	return cfg
 }
 
 func (c *Config) Validate() error {
@@ -415,14 +479,28 @@ func (c *Config) Validate() error {
 	if c.GTP.KernelInterface == "" {
 		errs = append(errs, "gtp.kernel_interface is required")
 	}
-	if c.GTP.Echo.IntervalSeconds <= 0 {
-		errs = append(errs, "gtp.echo.interval_seconds must be greater than 0")
+	if c.GTP.ControlEcho.IntervalSeconds <= 0 {
+		errs = append(errs, "gtp.control_echo.interval_seconds must be greater than 0")
 	}
-	if c.GTP.Echo.TimeoutSeconds <= 0 {
-		errs = append(errs, "gtp.echo.timeout_seconds must be greater than 0")
+	if c.GTP.ControlEcho.TimeoutSeconds <= 0 {
+		errs = append(errs, "gtp.control_echo.timeout_seconds must be greater than 0")
 	}
-	if c.GTP.Echo.MaxFailures <= 0 {
-		errs = append(errs, "gtp.echo.max_failures must be greater than 0")
+	if c.GTP.ControlEcho.MaxFailures <= 0 {
+		errs = append(errs, "gtp.control_echo.max_failures must be greater than 0")
+	}
+	if c.GTP.UserEcho.Enabled {
+		if c.GTP.UserEcho.Mode != "kernel_netlink" {
+			errs = append(errs, "gtp.user_echo.mode must be kernel_netlink")
+		}
+		if c.GTP.UserEcho.IntervalSeconds <= 0 {
+			errs = append(errs, "gtp.user_echo.interval_seconds must be greater than 0")
+		}
+		if c.GTP.UserEcho.TimeoutSeconds <= 0 {
+			errs = append(errs, "gtp.user_echo.timeout_seconds must be greater than 0")
+		}
+		if c.GTP.UserEcho.MaxFailures <= 0 {
+			errs = append(errs, "gtp.user_echo.max_failures must be greater than 0")
+		}
 	}
 	if c.Recovery.RecoveryWindowSeconds <= 0 {
 		errs = append(errs, "session_recovery.recovery_window_seconds must be greater than 0")

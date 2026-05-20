@@ -46,11 +46,17 @@ func TestDefaultsAndAccessFanout(t *testing.T) {
 	if cfg.Radius.AccessAccept.TerminationAction != "radius_request" {
 		t.Fatalf("radius access accept termination action default = %q", cfg.Radius.AccessAccept.TerminationAction)
 	}
-	if !cfg.GTP.Echo.Enabled || !cfg.GTP.Echo.StartupProbe {
-		t.Fatalf("gtp echo defaults disabled: %#v", cfg.GTP.Echo)
+	if !cfg.GTP.ControlEcho.Enabled || !cfg.GTP.ControlEcho.StartupProbe {
+		t.Fatalf("gtp control echo defaults disabled: %#v", cfg.GTP.ControlEcho)
 	}
-	if cfg.GTP.Echo.IntervalSeconds != 30 || cfg.GTP.Echo.TimeoutSeconds != 5 || cfg.GTP.Echo.MaxFailures != 3 {
-		t.Fatalf("unexpected gtp echo defaults: %#v", cfg.GTP.Echo)
+	if cfg.GTP.ControlEcho.IntervalSeconds != 30 || cfg.GTP.ControlEcho.TimeoutSeconds != 5 || cfg.GTP.ControlEcho.MaxFailures != 3 {
+		t.Fatalf("unexpected gtp control echo defaults: %#v", cfg.GTP.ControlEcho)
+	}
+	if cfg.GTP.UserEcho.Enabled {
+		t.Fatalf("gtp user echo default enabled: %#v", cfg.GTP.UserEcho)
+	}
+	if cfg.GTP.UserEcho.Mode != "kernel_netlink" || cfg.GTP.UserEcho.IntervalSeconds != 30 || cfg.GTP.UserEcho.TimeoutSeconds != 5 || cfg.GTP.UserEcho.MaxFailures != 3 {
+		t.Fatalf("unexpected gtp user echo defaults: %#v", cfg.GTP.UserEcho)
 	}
 	if cfg.GTP.KernelInterface != "gtp0" {
 		t.Fatalf("gtp.kernel_interface default = %q", cfg.GTP.KernelInterface)
@@ -98,14 +104,17 @@ gtp:
 radius:
   secret: testing123
 `)
-	if cfg.GTP.Echo.Enabled {
-		t.Fatal("gtp.echo.enabled = true, want false")
+	if cfg.GTP.ControlEcho.Enabled {
+		t.Fatal("gtp.control_echo.enabled = true, want false")
 	}
-	if cfg.GTP.Echo.IntervalSeconds != 10 || cfg.GTP.Echo.TimeoutSeconds != 2 || cfg.GTP.Echo.MaxFailures != 4 {
-		t.Fatalf("unexpected gtp echo config: %#v", cfg.GTP.Echo)
+	if cfg.GTP.ControlEcho.IntervalSeconds != 10 || cfg.GTP.ControlEcho.TimeoutSeconds != 2 || cfg.GTP.ControlEcho.MaxFailures != 4 {
+		t.Fatalf("unexpected gtp control echo config: %#v", cfg.GTP.ControlEcho)
 	}
-	if cfg.GTP.Echo.StartupProbe {
-		t.Fatal("gtp.echo.startup_probe = true, want false")
+	if cfg.GTP.ControlEcho.StartupProbe {
+		t.Fatal("gtp.control_echo.startup_probe = true, want false")
+	}
+	if cfg.GTP.Echo != cfg.GTP.ControlEcho {
+		t.Fatalf("legacy gtp.echo not mirrored to control_echo: echo=%#v control=%#v", cfg.GTP.Echo, cfg.GTP.ControlEcho)
 	}
 }
 
@@ -115,9 +124,9 @@ func TestGTPEchoValidation(t *testing.T) {
 		body string
 		want string
 	}{
-		{name: "interval", body: "interval_seconds: -1", want: "gtp.echo.interval_seconds must be greater than 0"},
-		{name: "timeout", body: "timeout_seconds: -1", want: "gtp.echo.timeout_seconds must be greater than 0"},
-		{name: "max failures", body: "max_failures: -1", want: "gtp.echo.max_failures must be greater than 0"},
+		{name: "interval", body: "interval_seconds: -1", want: "gtp.control_echo.interval_seconds must be greater than 0"},
+		{name: "timeout", body: "timeout_seconds: -1", want: "gtp.control_echo.timeout_seconds must be greater than 0"},
+		{name: "max failures", body: "max_failures: -1", want: "gtp.control_echo.max_failures must be greater than 0"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			_, err := loadYAML(t, baseConfigNoGTP()+`
@@ -133,6 +142,72 @@ radius:
 `)
 			if err == nil {
 				t.Fatal("expected gtp echo validation error")
+			}
+			if !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("unexpected error: %v", err)
+			}
+		})
+	}
+}
+
+func TestGTPControlAndUserEchoConfig(t *testing.T) {
+	cfg := mustLoadYAML(t, baseConfigNoGTP()+`
+gtp:
+  local_gtpc_ip: 127.0.0.1
+  local_gtpu_ip: 127.0.0.1
+  remote_pgw_gtpc_ip: 127.0.0.2
+  remote_pgw_gtpu_ip: 127.0.0.2
+  control_echo:
+    enabled: true
+    interval_seconds: 31
+    timeout_seconds: 6
+    max_failures: 4
+    startup_probe: true
+  user_echo:
+    enabled: true
+    mode: kernel_netlink
+    interval_seconds: 17
+    timeout_seconds: 3
+    max_failures: 2
+    startup_probe: true
+    require_kernel_support: false
+radius:
+  secret: testing123
+`)
+	if !cfg.GTP.ControlEcho.Enabled || cfg.GTP.ControlEcho.IntervalSeconds != 31 || cfg.GTP.ControlEcho.TimeoutSeconds != 6 || cfg.GTP.ControlEcho.MaxFailures != 4 || !cfg.GTP.ControlEcho.StartupProbe {
+		t.Fatalf("control echo = %#v", cfg.GTP.ControlEcho)
+	}
+	if !cfg.GTP.UserEcho.Enabled || cfg.GTP.UserEcho.Mode != "kernel_netlink" || cfg.GTP.UserEcho.IntervalSeconds != 17 || cfg.GTP.UserEcho.TimeoutSeconds != 3 || cfg.GTP.UserEcho.MaxFailures != 2 || !cfg.GTP.UserEcho.StartupProbe {
+		t.Fatalf("user echo = %#v", cfg.GTP.UserEcho)
+	}
+}
+
+func TestGTPUserEchoValidation(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		body string
+		want string
+	}{
+		{name: "mode", body: "mode: raw_udp", want: "gtp.user_echo.mode must be kernel_netlink"},
+		{name: "interval", body: "interval_seconds: -1", want: "gtp.user_echo.interval_seconds must be greater than 0"},
+		{name: "timeout", body: "timeout_seconds: -1", want: "gtp.user_echo.timeout_seconds must be greater than 0"},
+		{name: "max failures", body: "max_failures: -1", want: "gtp.user_echo.max_failures must be greater than 0"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := loadYAML(t, baseConfigNoGTP()+`
+gtp:
+  local_gtpc_ip: 127.0.0.1
+  local_gtpu_ip: 127.0.0.1
+  remote_pgw_gtpc_ip: 127.0.0.2
+  remote_pgw_gtpu_ip: 127.0.0.2
+  user_echo:
+    enabled: true
+    `+tc.body+`
+radius:
+  secret: testing123
+`)
+			if err == nil {
+				t.Fatal("expected gtp user echo validation error")
 			}
 			if !strings.Contains(err.Error(), tc.want) {
 				t.Fatalf("unexpected error: %v", err)

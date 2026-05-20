@@ -124,6 +124,23 @@ func TestEncodeDecodeEchoResponse(t *testing.T) {
 	}
 }
 
+func TestEncodeDecodeEchoRequest(t *testing.T) {
+	packet, err := EncodeEchoRequest(0x4321)
+	if err != nil {
+		t.Fatalf("EncodeEchoRequest() error = %v", err)
+	}
+	msg, err := DecodeControlPacket(packet)
+	if err != nil {
+		t.Fatalf("DecodeControlPacket() error = %v", err)
+	}
+	if msg.Type != msgTypeEchoRequest || msg.Sequence != 0x4321 || msg.TEID != 0 {
+		t.Fatalf("unexpected echo request %#v", msg)
+	}
+	if len(msg.Payload) != 0 {
+		t.Fatalf("echo request payload length = %d, want 0", len(msg.Payload))
+	}
+}
+
 func TestDecodeErrorIndicationOffendingTEID(t *testing.T) {
 	packet := make([]byte, headerLenGTPUWithSequence+5)
 	packet[0] = 0x32
