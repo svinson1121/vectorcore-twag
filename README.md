@@ -809,9 +809,6 @@ duplicate attach suppressed; existing active PGW session reused
 
 ## License
 
-Add the project license here.
-
-If this project derives from or incorporates code from another project, preserve required copyright notices and license text.
 
 ---
 
