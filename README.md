@@ -28,13 +28,13 @@ Currently implemented or being validated:
 - PGW-initiated GTP-C Echo Request handling
 - GTP-U Error Indication handling
 - Session recovery tombstones
+- RADIUS Disconnect / CoA recovery using the learned per-session AP/NAS source IP
 - Duplicate Create Session / StarOS context-replacement protection
 - Graceful shutdown improvements
 
 Items still being hardened:
 
 - GTP-U Echo support through Linux kernel GTP generic netlink where supported
-- RADIUS Disconnect / CoA recovery against AP/NAS
 - Post-activation user-plane health checks
 - Broader AP compatibility testing
 - Long-duration stability testing
@@ -100,7 +100,9 @@ On EAP success, TWAG sends RADIUS Access-Accept with:
 - MS-MPPE-Send-Key
 - MS-MPPE-Recv-Key
 - Optional VLAN assignment
-- Optional Session-Timeout / Termination-Action
+- Session-Timeout / Termination-Action when configured
+
+Access-Accept is only sent after PGW Create Session succeeds and local GTP, routing, DHCP/ARP, and access bindings are ready.
 
 ### Diameter STa
 
@@ -211,34 +213,25 @@ subscriber:
   default_realm: ims.mnc435.mcc311.3gppnetwork.org
 
 gtp:
-  local_gtpc_ip: 192.168.105.97
-  local_gtpu_ip: 192.168.105.97
+  local_gtpc_ip: 10.90.250.186
+  local_gtpu_ip: 10.90.250.186
   remote_pgw_gtpc_ip: 10.90.250.92
   remote_pgw_gtpu_ip: 10.90.250.92
   apn: internet
   charging_characteristics: "0800"
   kernel_interface: gtp0
 
-  control_echo:
+  echo:
     enabled: true
     interval_seconds: 30
     timeout_seconds: 5
     max_failures: 3
     startup_probe: true
-
-  user_echo:
-    enabled: true
-    mode: kernel_netlink
-    interval_seconds: 30
-    timeout_seconds: 5
-    max_failures: 3
-    startup_probe: true
-    require_kernel_support: false
 
 session_recovery:
   enabled: true
   reason_gtpu_error_indication: true
-  recovery_window_seconds: 120
+  recovery_window_seconds: 60
   stale_client_grace_seconds: 10
   cleanup_on_duplicate_attach: true
   allow_same_mac_reattach: true
@@ -247,13 +240,18 @@ session_recovery:
 
   radius_disconnect:
     enabled: true
-    nas_ip: 192.168.105.71
     nas_port: 3799
     secret: testing123
     timeout_seconds: 3
     retries: 2
     request_type: disconnect
     fallback_to_recovery_tombstone: true
+
+session_lifecycle:
+  duplicate_attach_policy: reuse_existing
+  duplicate_attach_cleanup_timeout_seconds: 5
+  suppress_duplicate_create_session: true
+  per_subscriber_lock_timeout_seconds: 10
 
 routing:
   enable_ip_forwarding: true
@@ -317,6 +315,8 @@ TWAG can use RADIUS Dynamic Authorization to force AP-side reauthentication when
 
 This normally uses UDP/3799.
 
+TWAG does not use a static NAS IP for Disconnect/CoA. Each AP/NAS may have a DHCP-assigned address, so TWAG stores the per-session source from the RADIUS Access-Request. If the request contains `NAS-IP-Address`, that value is stored; otherwise TWAG stores the UDP source IP of the Access-Request. Recovery Disconnect/CoA is sent back to that learned session source on `radius_disconnect.nas_port`.
+
 The AP/controller must support and allow:
 
 ```text
@@ -339,15 +339,17 @@ If the AP does not support this, TWAG falls back to recovery tombstone behavior 
 2. AP sends RADIUS Access-Request to TWAG.
 3. TWAG exchanges EAP-AKA′ with AAA over Diameter STa.
 4. AAA returns EAP success and MSK.
-5. TWAG creates PGW session over GTP-C.
-6. PGW assigns subscriber IP.
-7. TWAG installs kernel GTP PDP/session.
-8. TWAG installs access binding for MAC/IP.
-9. TWAG returns RADIUS Access-Accept.
-10. UE sends DHCP.
-11. TWAG replies with PGW-assigned IP.
-12. TWAG answers ARP for virtual gateway.
-13. UE traffic flows through GTP-U.
+5. TWAG defers RADIUS Access-Accept until the PGW session is usable.
+6. TWAG creates PGW session over GTP-C.
+7. PGW assigns subscriber IP.
+8. TWAG installs kernel GTP PDP/session.
+9. TWAG installs routing and access binding for MAC/IP.
+10. TWAG prepares DHCP/ARP authorization.
+11. TWAG returns RADIUS Access-Accept.
+12. UE sends DHCP.
+13. TWAG replies with PGW-assigned IP.
+14. TWAG answers ARP for virtual gateway.
+15. UE traffic flows through GTP-U.
 ```
 
 ### Normal Detach
@@ -394,7 +396,8 @@ TWAG must prevent this during normal operation.
 Rules:
 
 ```text
-One active or activating session per IMSI/MAC/APN.
+One active or activating PGW session per IMSI/APN/default bearer.
+Local access correlation also tracks MAC/IMSI/APN.
 If duplicate EAP success occurs for an already-active session, reuse the existing session.
 If replacement is required, delete and clean the old session before sending a new Create Session.
 Do not rely on PGW context replacement as normal behavior.
@@ -636,7 +639,7 @@ possible causes:
 ```text
 UE/AP still thinks 802.1X is authorized but TWAG removed PGW session.
 Recovery tombstone exists.
-RADIUS Disconnect/CoA failed or is not enabled.
+RADIUS Disconnect/CoA failed, is not enabled, or the AP does not allow TWAG as a dynamic authorization client.
 UE has not re-run EAP yet.
 ```
 
@@ -644,6 +647,7 @@ Recommended fix path:
 
 ```text
 Enable RADIUS Disconnect/CoA if AP supports it.
+Allow TWAG's RADIUS source IP as a dynamic authorization client on the AP/controller.
 Set Session-Timeout and Termination-Action in Access-Accept.
 Ensure recovery tombstone logs distinguish stale recovery clients from truly unauthorized clients.
 ```
@@ -754,6 +758,7 @@ Successful attach:
 ```text
 RADIUS Access-Request received
 STa EAP answer received state=success
+RADIUS Access-Accept deferred until PGW session ready
 authorized subscriber attach requested
 GTP-C Create Session Request sent
 GTP-C Create Session Response received gtp_cause=16
@@ -761,6 +766,7 @@ PGW assigned subscriber IP
 kernel GTP session added
 access forwarding neighbor installed
 session active
+PGW session ready; sending RADIUS Access-Accept
 RADIUS Access-Accept sent
 DHCP Ack sent
 ARP proxy reply sent
@@ -782,7 +788,7 @@ Recovery:
 ```text
 GTP-U Error Indication received mapped=true
 session recovery pending
-RADIUS Disconnect-Request sent
+RADIUS Disconnect-Request sent for session recovery
 fresh RADIUS/EAP reauth observed
 session recovery completed
 ```
@@ -801,7 +807,7 @@ duplicate attach suppressed; existing active PGW session reused
 - Only authorized MAC/IMSI/APN sessions should receive DHCP/ARP service.
 - Do not ACK DHCP for a client without an active PGW/GTP session.
 - RADIUS shared secrets must be protected.
-- RADIUS Dynamic Authorization should only accept/send traffic to trusted AP/NAS IPs.
+- AP/controllers should only accept RADIUS Dynamic Authorization from TWAG's trusted RADIUS source IP.
 - Avoid exposing the TWAG management/logging interface on untrusted networks.
 - The access VLAN should be isolated from general LAN traffic.
 

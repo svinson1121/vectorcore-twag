@@ -31,7 +31,11 @@ func (d *DynamicAuthorizer) DisconnectOrCoA(ctx context.Context, tombstone *sess
 	if !d.cfg.Enabled {
 		return fmt.Errorf("RADIUS dynamic authorization disabled")
 	}
-	addr := fmt.Sprintf("%s:%d", d.cfg.NASIP, d.cfg.NASPort)
+	nasIP := tombstone.NASIP
+	if net.ParseIP(nasIP) == nil {
+		return fmt.Errorf("RADIUS dynamic authorization destination NAS IP unavailable for session")
+	}
+	addr := fmt.Sprintf("%s:%d", nasIP, d.cfg.NASPort)
 	code := radiustransport.CodeDisconnectRequest
 	ack := radiustransport.CodeDisconnectACK
 	nak := radiustransport.CodeDisconnectNAK
@@ -46,17 +50,22 @@ func (d *DynamicAuthorizer) DisconnectOrCoA(ctx context.Context, tombstone *sess
 	var lastErr error
 	for attempt := 1; attempt <= attempts; attempt++ {
 		packet := radiustransport.New(code, []byte(d.cfg.Secret))
-		addDynamicAuthorizationAttributes(packet, tombstone, d.cfg.NASIP)
+		addDynamicAuthorizationAttributes(packet, tombstone, nasIP)
 		timeout := time.Duration(d.cfg.TimeoutSeconds) * time.Second
 		if timeout <= 0 {
 			timeout = 3 * time.Second
 		}
 		attemptCtx, cancel := context.WithTimeout(ctx, timeout)
-		d.log.Info("RADIUS dynamic authorization request sent",
+		msg := "RADIUS Disconnect-Request sent for session recovery"
+		if requestType == "coa" {
+			msg = "RADIUS CoA-Request sent for session recovery"
+		}
+		d.log.Info(msg,
 			"request_type", requestType,
 			"attempt", attempt,
 			"max_attempts", attempts,
-			"nas_addr", addr,
+			"nas_ip", nasIP,
+			"nas_port", d.cfg.NASPort,
 			"old_session_id", tombstone.OldSessionID,
 			"imsi", tombstone.IMSI,
 			"mac", tombstone.MAC.String(),
@@ -111,13 +120,18 @@ func addDynamicAuthorizationAttributes(packet *radiustransport.Packet, tombstone
 	if callingStationID != "" {
 		_ = rfc2865.CallingStationID_SetString(packet, callingStationID)
 	}
+	if tombstone.CalledStationID != "" {
+		_ = rfc2865.CalledStationID_SetString(packet, tombstone.CalledStationID)
+	}
 	if ip := net.ParseIP(nasIP); ip != nil {
 		_ = rfc2865.NASIPAddress_Set(packet, ip)
 	}
 	if tombstone.NASIdentifier != "" {
 		_ = rfc2865.NASIdentifier_SetString(packet, tombstone.NASIdentifier)
 	}
-	if tombstone.OldSessionID != "" {
+	if tombstone.AcctSessionID != "" {
+		_ = rfc2866.AcctSessionID_SetString(packet, tombstone.AcctSessionID)
+	} else if tombstone.OldSessionID != "" {
 		_ = rfc2866.AcctSessionID_SetString(packet, tombstone.OldSessionID)
 	}
 	if len(tombstone.Class) > 0 {

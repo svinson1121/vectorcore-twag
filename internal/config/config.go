@@ -153,7 +153,6 @@ type RecoveryConfig struct {
 
 type RadiusDisconnectConfig struct {
 	Enabled                     bool   `yaml:"enabled"`
-	NASIP                       string `yaml:"nas_ip"`
 	NASPort                     int    `yaml:"nas_port"`
 	Secret                      string `yaml:"secret"`
 	TimeoutSeconds              int    `yaml:"timeout_seconds"`
@@ -231,7 +230,7 @@ func Default() *Config {
 			},
 		},
 		GTP:       GTPConfig{ChargingCharacteristics: "0800", KernelInterface: "gtp0", Echo: GTPEchoConfig{Enabled: true, IntervalSeconds: 30, TimeoutSeconds: 5, MaxFailures: 3, StartupProbe: true}},
-		Recovery:  RecoveryConfig{Enabled: true, ReasonGTPUError: true, RecoveryWindowSeconds: 60, StaleClientGraceSeconds: 10, CleanupOnDuplicateAttach: true, AllowSameMACReattach: true, RejectOldDHCPIP: true, DHCPStaleRequestAction: "ignore", RadiusDisconnect: RadiusDisconnectConfig{NASPort: 3799, TimeoutSeconds: 3, Retries: 2, RequestType: "disconnect", FallbackToRecoveryTombstone: true}},
+		Recovery:  RecoveryConfig{Enabled: true, ReasonGTPUError: true, RecoveryWindowSeconds: 60, StaleClientGraceSeconds: 10, CleanupOnDuplicateAttach: true, AllowSameMACReattach: true, RejectOldDHCPIP: true, DHCPStaleRequestAction: "nak", RadiusDisconnect: RadiusDisconnectConfig{NASPort: 3799, TimeoutSeconds: 3, Retries: 2, RequestType: "disconnect", FallbackToRecoveryTombstone: true}},
 		Lifecycle: LifecycleConfig{DuplicateAttachPolicy: "reuse_existing", DuplicateAttachCleanupTimeoutSeconds: 5, SuppressDuplicateCreateSession: true, PerSubscriberLockTimeoutSeconds: 10},
 		Routing:   RoutingConfig{InstallRoutes: true},
 	}
@@ -303,7 +302,10 @@ func (c *Config) ApplyDefaults() {
 		c.Recovery.StaleClientGraceSeconds = 10
 	}
 	if c.Recovery.DHCPStaleRequestAction == "" {
-		c.Recovery.DHCPStaleRequestAction = "ignore"
+		c.Recovery.DHCPStaleRequestAction = "nak"
+	}
+	if c.Recovery.RejectOldDHCPIP {
+		c.Recovery.DHCPStaleRequestAction = "nak"
 	}
 	c.Access.DHCP.StaleRequestAction = c.Recovery.DHCPStaleRequestAction
 	if c.Recovery.RadiusDisconnect.NASPort == 0 {
@@ -432,9 +434,6 @@ func (c *Config) Validate() error {
 		errs = append(errs, "session_recovery.dhcp_stale_request_action must be ignore or nak")
 	}
 	if c.Recovery.RadiusDisconnect.Enabled {
-		if net.ParseIP(c.Recovery.RadiusDisconnect.NASIP) == nil {
-			errs = append(errs, "session_recovery.radius_disconnect.nas_ip is required and must be a valid IP when enabled")
-		}
 		if c.Recovery.RadiusDisconnect.Secret == "" {
 			errs = append(errs, "session_recovery.radius_disconnect.secret is required when enabled")
 		}

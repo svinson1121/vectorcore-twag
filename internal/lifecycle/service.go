@@ -22,14 +22,24 @@ import (
 )
 
 type AttachRequest struct {
-	IMSI       string `json:"imsi,omitempty"`
-	MSISDN     string `json:"msisdn,omitempty"`
-	MACAddress string `json:"mac,omitempty"`
-	Username   string `json:"username,omitempty"`
-	Realm      string `json:"realm,omitempty"`
-	APN        string `json:"apn,omitempty"`
-	Ki         string `json:"ki,omitempty"`
-	OPc        string `json:"opc,omitempty"`
+	IMSI             string `json:"imsi,omitempty"`
+	MSISDN           string `json:"msisdn,omitempty"`
+	MACAddress       string `json:"mac,omitempty"`
+	Username         string `json:"username,omitempty"`
+	EAPIdentity      string `json:"eap_identity,omitempty"`
+	Realm            string `json:"realm,omitempty"`
+	APN              string `json:"apn,omitempty"`
+	CallingStationID string `json:"calling_station_id,omitempty"`
+	CalledStationID  string `json:"called_station_id,omitempty"`
+	NASIP            string `json:"nas_ip,omitempty"`
+	NASIdentifier    string `json:"nas_identifier,omitempty"`
+	AcctSessionID    string `json:"acct_session_id,omitempty"`
+	RadiusState      string `json:"radius_state,omitempty"`
+	RadiusClass      []byte `json:"radius_class,omitempty"`
+	ConnectInfo      string `json:"connect_info,omitempty"`
+	FramedMTU        uint32 `json:"framed_mtu,omitempty"`
+	Ki               string `json:"ki,omitempty"`
+	OPc              string `json:"opc,omitempty"`
 }
 
 type AttachResponse struct {
@@ -57,14 +67,23 @@ type DetachRequest struct {
 }
 
 type EAPRequest struct {
-	SessionID  string
-	IMSI       string
-	MSISDN     string
-	MACAddress string
-	Username   string
-	Realm      string
-	APN        string
-	EAPPayload []byte
+	SessionID        string
+	IMSI             string
+	MSISDN           string
+	MACAddress       string
+	Username         string
+	EAPIdentity      string
+	Realm            string
+	APN              string
+	CallingStationID string
+	CalledStationID  string
+	NASIP            string
+	NASIdentifier    string
+	AcctSessionID    string
+	RadiusClass      []byte
+	ConnectInfo      string
+	FramedMTU        uint32
+	EAPPayload       []byte
 }
 
 type EAPResponse struct {
@@ -173,14 +192,25 @@ func (s *Service) Attach(ctx context.Context, req AttachRequest) (*AttachRespons
 		}
 	}
 	sess := s.sessions.Create(session.CreateInput{
-		IMSI:            req.IMSI,
-		MSISDN:          req.MSISDN,
-		MACAddress:      req.MACAddress,
-		APN:             req.APN,
-		Realm:           req.Realm,
-		AccessType:      "ethernet",
-		AccessInterface: s.cfg.Access.Interface,
-		GatewayIP:       s.sessionGatewayIP(),
+		IMSI:             req.IMSI,
+		MSISDN:           req.MSISDN,
+		MACAddress:       req.MACAddress,
+		APN:              req.APN,
+		Realm:            req.Realm,
+		Username:         req.Username,
+		EAPIdentity:      req.EAPIdentity,
+		CallingStationID: req.CallingStationID,
+		CalledStationID:  req.CalledStationID,
+		NASIP:            req.NASIP,
+		NASIdentifier:    req.NASIdentifier,
+		AcctSessionID:    req.AcctSessionID,
+		RadiusState:      req.RadiusState,
+		RadiusClass:      req.RadiusClass,
+		ConnectInfo:      req.ConnectInfo,
+		FramedMTU:        req.FramedMTU,
+		AccessType:       "ethernet",
+		AccessInterface:  s.cfg.Access.Interface,
+		GatewayIP:        s.sessionGatewayIP(),
 	})
 	if _, err := s.sessions.MarkAuthPending(sess.ID); err != nil {
 		return nil, err
@@ -287,14 +317,25 @@ func (s *Service) AttachAuthorized(ctx context.Context, req AttachRequest, auth 
 		}
 	}
 	sess := s.sessions.Create(session.CreateInput{
-		IMSI:            coalesceString(auth.IMSI, req.IMSI),
-		MSISDN:          coalesceString(auth.MSISDN, req.MSISDN),
-		MACAddress:      req.MACAddress,
-		APN:             coalesceString(auth.APN, req.APN),
-		Realm:           req.Realm,
-		AccessType:      "ethernet",
-		AccessInterface: s.cfg.Access.Interface,
-		GatewayIP:       s.sessionGatewayIP(),
+		IMSI:             coalesceString(auth.IMSI, req.IMSI),
+		MSISDN:           coalesceString(auth.MSISDN, req.MSISDN),
+		MACAddress:       req.MACAddress,
+		APN:              coalesceString(auth.APN, req.APN),
+		Realm:            req.Realm,
+		Username:         req.Username,
+		EAPIdentity:      req.EAPIdentity,
+		CallingStationID: req.CallingStationID,
+		CalledStationID:  req.CalledStationID,
+		NASIP:            req.NASIP,
+		NASIdentifier:    req.NASIdentifier,
+		AcctSessionID:    req.AcctSessionID,
+		RadiusState:      req.RadiusState,
+		RadiusClass:      req.RadiusClass,
+		ConnectInfo:      req.ConnectInfo,
+		FramedMTU:        req.FramedMTU,
+		AccessType:       "ethernet",
+		AccessInterface:  s.cfg.Access.Interface,
+		GatewayIP:        s.sessionGatewayIP(),
 	})
 	if _, err := s.sessions.MarkAuthPending(sess.ID); err != nil {
 		return nil, err
@@ -354,13 +395,28 @@ func (s *Service) ExchangeEAP(ctx context.Context, req EAPRequest) (*EAPResponse
 			MSK:        append([]byte(nil), res.MSK...),
 		}, aaa.ErrRejected
 	}
+	s.log.Info("RADIUS Access-Accept deferred until PGW session ready",
+		"imsi", coalesceString(res.IMSI, req.IMSI),
+		"mac", req.MACAddress,
+		"apn", coalesceString(res.APN, req.APN),
+	)
 	attach, err := s.AttachAuthorized(ctx, AttachRequest{
-		IMSI:       coalesceString(res.IMSI, req.IMSI),
-		MSISDN:     coalesceString(res.MSISDN, req.MSISDN),
-		MACAddress: req.MACAddress,
-		Username:   req.Username,
-		Realm:      req.Realm,
-		APN:        coalesceString(res.APN, req.APN),
+		IMSI:             coalesceString(res.IMSI, req.IMSI),
+		MSISDN:           coalesceString(res.MSISDN, req.MSISDN),
+		MACAddress:       req.MACAddress,
+		Username:         req.Username,
+		EAPIdentity:      req.EAPIdentity,
+		Realm:            req.Realm,
+		APN:              coalesceString(res.APN, req.APN),
+		CallingStationID: req.CallingStationID,
+		CalledStationID:  req.CalledStationID,
+		NASIP:            req.NASIP,
+		NASIdentifier:    req.NASIdentifier,
+		AcctSessionID:    req.AcctSessionID,
+		RadiusState:      req.SessionID,
+		RadiusClass:      req.RadiusClass,
+		ConnectInfo:      req.ConnectInfo,
+		FramedMTU:        req.FramedMTU,
 	}, &aaa.AuthResult{
 		Allowed:      true,
 		IMSI:         coalesceString(res.IMSI, req.IMSI),
@@ -373,6 +429,12 @@ func (s *Service) ExchangeEAP(ctx context.Context, req EAPRequest) (*EAPResponse
 	if err != nil {
 		return nil, err
 	}
+	s.log.Info("PGW session ready; sending RADIUS Access-Accept",
+		"session_id", attach.SessionID,
+		"subscriber_ip", attach.SubscriberIP,
+		"remote_gtpu_teid", fmt.Sprintf("0x%08x", eapSessionTEID(s.sessions, attach.SessionID, true)),
+		"local_gtpu_teid", fmt.Sprintf("0x%08x", eapSessionTEID(s.sessions, attach.SessionID, false)),
+	)
 	return &EAPResponse{
 		SessionID:    coalesceString(attach.SessionID, res.SessionID),
 		State:        string(aaa.EAPStateSuccess),
@@ -685,7 +747,6 @@ func (s *Service) attemptDynamicAuthorization(ctx context.Context, tombstone *se
 	updated, ok := s.sessions.UpdateRecovery(tombstone.OldSessionID, func(t *session.RecoveryTombstone) {
 		t.State = session.RecoveryDisconnecting
 		t.LastAction = s.cfg.Recovery.RadiusDisconnect.RequestType
-		t.NASIP = s.cfg.Recovery.RadiusDisconnect.NASIP
 		if t.CallingStationID == "" && t.MAC != nil {
 			t.CallingStationID = t.MAC.String()
 		}
@@ -703,7 +764,7 @@ func (s *Service) attemptDynamicAuthorization(ctx context.Context, tombstone *se
 		"old_subscriber_ip", ipString(tombstone.OldSubscriberIP),
 		"recovery_state", session.RecoveryDisconnecting,
 		"request_type", s.cfg.Recovery.RadiusDisconnect.RequestType,
-		"nas_ip", s.cfg.Recovery.RadiusDisconnect.NASIP,
+		"nas_ip", tombstone.NASIP,
 	)
 	if err := s.dynamicAuthorizer.DisconnectOrCoA(ctx, tombstone); err != nil {
 		s.log.Warn("RADIUS dynamic authorization failed; entering fallback recovery tombstone",
@@ -955,7 +1016,11 @@ func (s *Service) lockSubscriber(ctx context.Context, imsi, mac, apn string) (fu
 }
 
 func subscriberLockKey(imsi, mac, apn string) string {
-	return strings.TrimSpace(imsi) + "|" + normalizeMAC(mac) + "|" + strings.ToLower(strings.TrimSpace(apn))
+	apn = strings.ToLower(strings.TrimSpace(apn))
+	if imsi = strings.TrimSpace(imsi); imsi != "" {
+		return imsi + "||" + apn
+	}
+	return "|" + normalizeMAC(mac) + "|" + apn
 }
 
 func (s *Service) withDefaults(req AttachRequest) AttachRequest {
@@ -964,6 +1029,12 @@ func (s *Service) withDefaults(req AttachRequest) AttachRequest {
 	}
 	if req.Realm == "" {
 		req.Realm = s.cfg.Subscriber.DefaultRealm
+	}
+	if req.CallingStationID == "" {
+		req.CallingStationID = req.MACAddress
+	}
+	if req.EAPIdentity == "" {
+		req.EAPIdentity = req.Username
 	}
 	return req
 }
@@ -974,6 +1045,12 @@ func (s *Service) eapWithDefaults(req EAPRequest) EAPRequest {
 	}
 	if req.Realm == "" {
 		req.Realm = s.cfg.Subscriber.DefaultRealm
+	}
+	if req.CallingStationID == "" {
+		req.CallingStationID = req.MACAddress
+	}
+	if req.EAPIdentity == "" {
+		req.EAPIdentity = req.Username
 	}
 	return req
 }
@@ -1088,6 +1165,20 @@ func detachResponseFromSession(sess *session.Session) *DetachResponse {
 		APN:          sess.APN,
 		Reason:       sess.Reason,
 	}
+}
+
+func eapSessionTEID(sessions *session.Manager, sessionID string, remote bool) uint32 {
+	if sessions == nil || sessionID == "" {
+		return 0
+	}
+	sess, ok := sessions.Get(sessionID)
+	if !ok || sess == nil {
+		return 0
+	}
+	if remote {
+		return sess.RemoteGTPUTEID
+	}
+	return sess.LocalGTPUTEID
 }
 
 func ipString(ip net.IP) string {

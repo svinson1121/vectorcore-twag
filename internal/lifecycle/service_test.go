@@ -213,6 +213,54 @@ func TestGTPUErrorIndicationCreatesRecoveryTombstoneAndCleansUp(t *testing.T) {
 	}
 }
 
+func TestRecoveryTombstonePreservesRadiusSessionIdentifiers(t *testing.T) {
+	svc, deps := newTestService(t)
+	svc.cfg.Recovery = config.RecoveryConfig{Enabled: true, ReasonGTPUError: true, RecoveryWindowSeconds: 60, AllowSameMACReattach: true}
+	resp, err := svc.AttachAuthorized(context.Background(), AttachRequest{
+		IMSI:             "001010000000001",
+		MACAddress:       "aa:bb:cc:dd:ee:01",
+		Username:         "0311435000000001@wlan.example",
+		EAPIdentity:      "0311435000000001@wlan.example",
+		CallingStationID: "AA-BB-CC-DD-EE-01",
+		CalledStationID:  "11-22-33-44-55-66:lab",
+		NASIP:            "192.0.2.10",
+		NASIdentifier:    "ap-1",
+		AcctSessionID:    "acct-123",
+		RadiusState:      "diam-session-1",
+		RadiusClass:      []byte("class-blob"),
+		ConnectInfo:      "CONNECT 866Mbps",
+		FramedMTU:        1400,
+	}, nil)
+	if err != nil {
+		t.Fatalf("AttachAuthorized() error = %v", err)
+	}
+	if _, err := deps.sessions.ApplyPGWResult(resp.SessionID, nil, nil, 0x1001, 0x4e80a8e9, 0x80122006); err != nil {
+		t.Fatalf("ApplyPGWResult() error = %v", err)
+	}
+	if err := svc.HandleGTPUErrorIndication(context.Background(), gtpu.ErrorIndication{OffendingTEID: 0x80122006}); err != nil {
+		t.Fatalf("HandleGTPUErrorIndication() error = %v", err)
+	}
+	tombstone, ok := deps.sessions.FindRecovery("001010000000001", "aa:bb:cc:dd:ee:01")
+	if !ok {
+		t.Fatal("expected recovery tombstone")
+	}
+	if tombstone.OriginalUsername != "0311435000000001@wlan.example" || tombstone.EAPIdentity != "0311435000000001@wlan.example" {
+		t.Fatalf("identity = %q/%q", tombstone.OriginalUsername, tombstone.EAPIdentity)
+	}
+	if tombstone.CallingStationID != "AA-BB-CC-DD-EE-01" || tombstone.CalledStationID != "11-22-33-44-55-66:lab" {
+		t.Fatalf("station ids = %q/%q", tombstone.CallingStationID, tombstone.CalledStationID)
+	}
+	if tombstone.NASIP != "192.0.2.10" || tombstone.NASIdentifier != "ap-1" {
+		t.Fatalf("nas = %q/%q", tombstone.NASIP, tombstone.NASIdentifier)
+	}
+	if tombstone.AcctSessionID != "acct-123" || string(tombstone.Class) != "class-blob" {
+		t.Fatalf("acct/class = %q/%q", tombstone.AcctSessionID, string(tombstone.Class))
+	}
+	if tombstone.RadiusState != "diam-session-1" || tombstone.ConnectInfo != "CONNECT 866Mbps" || tombstone.FramedMTU != 1400 {
+		t.Fatalf("state/connect/mtu = %q/%q/%d", tombstone.RadiusState, tombstone.ConnectInfo, tombstone.FramedMTU)
+	}
+}
+
 func TestGTPUErrorIndicationSendsRadiusDisconnectWhenEnabled(t *testing.T) {
 	svc, deps := newTestService(t)
 	svc.cfg.Recovery = config.RecoveryConfig{
@@ -222,7 +270,6 @@ func TestGTPUErrorIndicationSendsRadiusDisconnectWhenEnabled(t *testing.T) {
 		AllowSameMACReattach:  true,
 		RadiusDisconnect: config.RadiusDisconnectConfig{
 			Enabled:                     true,
-			NASIP:                       "192.0.2.10",
 			NASPort:                     3799,
 			Secret:                      "secret",
 			RequestType:                 "disconnect",
@@ -234,6 +281,7 @@ func TestGTPUErrorIndicationSendsRadiusDisconnectWhenEnabled(t *testing.T) {
 	resp, err := svc.Attach(context.Background(), AttachRequest{
 		IMSI:       "001010000000001",
 		MACAddress: "aa:bb:cc:dd:ee:01",
+		NASIP:      "192.0.2.10",
 	})
 	if err != nil {
 		t.Fatalf("Attach() error = %v", err)
@@ -263,7 +311,6 @@ func TestGTPUErrorIndicationDynamicAuthorizationFailureFallsBack(t *testing.T) {
 		AllowSameMACReattach:  true,
 		RadiusDisconnect: config.RadiusDisconnectConfig{
 			Enabled:                     true,
-			NASIP:                       "192.0.2.10",
 			NASPort:                     3799,
 			Secret:                      "secret",
 			RequestType:                 "disconnect",
@@ -274,6 +321,7 @@ func TestGTPUErrorIndicationDynamicAuthorizationFailureFallsBack(t *testing.T) {
 	resp, err := svc.Attach(context.Background(), AttachRequest{
 		IMSI:       "001010000000001",
 		MACAddress: "aa:bb:cc:dd:ee:01",
+		NASIP:      "192.0.2.10",
 	})
 	if err != nil {
 		t.Fatalf("Attach() error = %v", err)

@@ -16,6 +16,7 @@ import (
 	"github.com/vectorcore/twag/internal/lifecycle"
 	radiustransport "layeh.com/radius"
 	"layeh.com/radius/rfc2865"
+	"layeh.com/radius/rfc2866"
 	"layeh.com/radius/rfc2868"
 	"layeh.com/radius/rfc2869"
 	"layeh.com/radius/rfc3580"
@@ -103,7 +104,7 @@ func (s *Server) handle(w radiustransport.ResponseWriter, r *radiustransport.Req
 		_ = w.Write(r.Response(radiustransport.CodeAccessReject))
 		return
 	}
-	req := s.eapRequest(r.Packet)
+	req := s.eapRequest(r.Packet, r.RemoteAddr)
 	eapInfo := describeEAP(req.EAPPayload)
 	s.log.Info("RADIUS Access-Request received",
 		"remote_addr", r.RemoteAddr.String(),
@@ -389,23 +390,61 @@ func (s *Server) setMessageAuthenticator(packet *radiustransport.Packet) error {
 	return rfc2869.MessageAuthenticator_Set(packet, mac.Sum(nil))
 }
 
-func (s *Server) eapRequest(packet *radiustransport.Packet) lifecycle.EAPRequest {
+func (s *Server) eapRequest(packet *radiustransport.Packet, remoteAddr net.Addr) lifecycle.EAPRequest {
 	username := rfc2865.UserName_GetString(packet)
 	eapPayload := rfc2869.EAPMessage_Get(packet)
+	eapID := eapIdentity(eapPayload)
 	if username == "" {
-		username = eapIdentity(eapPayload)
+		username = eapID
 	}
 	mac := normalizeMAC(rfc2865.CallingStationID_GetString(packet))
 	imsi := imsiFromNAI(username)
-	return lifecycle.EAPRequest{
-		SessionID:  rfc2865.State_GetString(packet),
-		IMSI:       imsi,
-		MACAddress: mac,
-		Username:   username,
-		Realm:      s.sub.DefaultRealm,
-		APN:        s.sub.DefaultAPN,
-		EAPPayload: eapPayload,
+	nasIP := ""
+	if ip := rfc2865.NASIPAddress_Get(packet); ip != nil && ip.To4() != nil {
+		nasIP = ip.String()
 	}
+	if nasIP == "" {
+		nasIP = radiusSourceIP(remoteAddr)
+	}
+	return lifecycle.EAPRequest{
+		SessionID:        rfc2865.State_GetString(packet),
+		IMSI:             imsi,
+		MACAddress:       mac,
+		Username:         username,
+		EAPIdentity:      eapID,
+		Realm:            s.sub.DefaultRealm,
+		APN:              s.sub.DefaultAPN,
+		CallingStationID: rfc2865.CallingStationID_GetString(packet),
+		CalledStationID:  rfc2865.CalledStationID_GetString(packet),
+		NASIP:            nasIP,
+		NASIdentifier:    rfc2865.NASIdentifier_GetString(packet),
+		AcctSessionID:    rfc2866.AcctSessionID_GetString(packet),
+		RadiusClass:      append([]byte(nil), rfc2865.Class_Get(packet)...),
+		ConnectInfo:      rfc2869.ConnectInfo_GetString(packet),
+		FramedMTU:        uint32(rfc2865.FramedMTU_Get(packet)),
+		EAPPayload:       eapPayload,
+	}
+}
+
+func radiusSourceIP(addr net.Addr) string {
+	switch a := addr.(type) {
+	case *net.UDPAddr:
+		if a != nil && a.IP != nil {
+			return a.IP.String()
+		}
+	case *net.TCPAddr:
+		if a != nil && a.IP != nil {
+			return a.IP.String()
+		}
+	}
+	if addr == nil {
+		return ""
+	}
+	host, _, err := net.SplitHostPort(addr.String())
+	if err != nil {
+		return ""
+	}
+	return host
 }
 
 func imsiFromNAI(username string) string {

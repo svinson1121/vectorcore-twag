@@ -11,15 +11,26 @@ import (
 )
 
 type CreateInput struct {
-	IMSI            string
-	MSISDN          string
-	MACAddress      string
-	APN             string
-	Realm           string
-	AccessType      string
-	AccessInterface string
-	GatewayIP       net.IP
-	TTL             time.Duration
+	IMSI             string
+	MSISDN           string
+	MACAddress       string
+	APN              string
+	Realm            string
+	Username         string
+	EAPIdentity      string
+	CallingStationID string
+	CalledStationID  string
+	NASIP            string
+	NASIdentifier    string
+	AcctSessionID    string
+	RadiusState      string
+	RadiusClass      []byte
+	ConnectInfo      string
+	FramedMTU        uint32
+	AccessType       string
+	AccessInterface  string
+	GatewayIP        net.IP
+	TTL              time.Duration
 }
 
 type Manager struct {
@@ -62,18 +73,29 @@ func (m *Manager) Create(input CreateInput) *Session {
 	m.next++
 	now := time.Now().UTC()
 	s := &Session{
-		ID:              fmt.Sprintf("twag-%d-%d", now.UnixNano(), m.next),
-		IMSI:            input.IMSI,
-		MSISDN:          input.MSISDN,
-		MACAddress:      input.MACAddress,
-		APN:             input.APN,
-		Realm:           input.Realm,
-		AccessType:      input.AccessType,
-		AccessInterface: input.AccessInterface,
-		GatewayIP:       cloneIP(input.GatewayIP),
-		State:           Pending,
-		CreatedAt:       now,
-		UpdatedAt:       now,
+		ID:               fmt.Sprintf("twag-%d-%d", now.UnixNano(), m.next),
+		IMSI:             input.IMSI,
+		MSISDN:           input.MSISDN,
+		MACAddress:       input.MACAddress,
+		APN:              input.APN,
+		Realm:            input.Realm,
+		Username:         input.Username,
+		EAPIdentity:      input.EAPIdentity,
+		CallingStationID: input.CallingStationID,
+		CalledStationID:  input.CalledStationID,
+		NASIP:            input.NASIP,
+		NASIdentifier:    input.NASIdentifier,
+		AcctSessionID:    input.AcctSessionID,
+		RadiusState:      input.RadiusState,
+		RadiusClass:      append([]byte(nil), input.RadiusClass...),
+		ConnectInfo:      input.ConnectInfo,
+		FramedMTU:        input.FramedMTU,
+		AccessType:       input.AccessType,
+		AccessInterface:  input.AccessInterface,
+		GatewayIP:        cloneIP(input.GatewayIP),
+		State:            Pending,
+		CreatedAt:        now,
+		UpdatedAt:        now,
 	}
 	if input.TTL > 0 {
 		s.ExpiresAt = now.Add(input.TTL)
@@ -350,20 +372,34 @@ func (m *Manager) AddRecoveryTombstone(sess *Session, reason string, ttl time.Du
 	defer m.mu.Unlock()
 	now := time.Now().UTC()
 	t := &RecoveryTombstone{
-		IMSI:            sess.IMSI,
-		APN:             sess.APN,
-		OldSubscriberIP: cloneIP(sess.SubscriberIP),
-		OldSessionID:    sess.ID,
-		OldRemoteTEID:   sess.RemoteGTPUTEID,
-		OldLocalTEID:    sess.LocalGTPUTEID,
-		Reason:          reason,
-		State:           RecoveryRequired,
-		CreatedAt:       now,
-		ExpiresAt:       now.Add(ttl),
+		IMSI:             sess.IMSI,
+		APN:              sess.APN,
+		OldSubscriberIP:  cloneIP(sess.SubscriberIP),
+		OldSessionID:     sess.ID,
+		OldRemoteTEID:    sess.RemoteGTPUTEID,
+		OldLocalTEID:     sess.LocalGTPUTEID,
+		OriginalUsername: sess.Username,
+		EAPIdentity:      sess.EAPIdentity,
+		RadiusState:      sess.RadiusState,
+		NASIP:            sess.NASIP,
+		NASIdentifier:    sess.NASIdentifier,
+		AcctSessionID:    sess.AcctSessionID,
+		CallingStationID: sess.CallingStationID,
+		CalledStationID:  sess.CalledStationID,
+		Class:            append([]byte(nil), sess.RadiusClass...),
+		ConnectInfo:      sess.ConnectInfo,
+		FramedMTU:        sess.FramedMTU,
+		Reason:           reason,
+		State:            RecoveryRequired,
+		CreatedAt:        now,
+		ExpiresAt:        now.Add(ttl),
 	}
 	if sess.MACAddress != "" {
 		if mac, err := net.ParseMAC(sess.MACAddress); err == nil {
 			t.MAC = append(net.HardwareAddr(nil), mac...)
+			if t.CallingStationID == "" {
+				t.CallingStationID = mac.String()
+			}
 		}
 	}
 	m.indexRecoveryLocked(t)
@@ -669,6 +705,7 @@ func clone(s *Session) *Session {
 	cp.GatewayIP = cloneIP(s.GatewayIP)
 	cp.PGWControlIP = cloneIP(s.PGWControlIP)
 	cp.PGWUserIP = cloneIP(s.PGWUserIP)
+	cp.RadiusClass = append([]byte(nil), s.RadiusClass...)
 	return &cp
 }
 

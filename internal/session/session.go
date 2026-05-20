@@ -39,6 +39,17 @@ type Session struct {
 	MACAddress        string    `json:"mac,omitempty"`
 	APN               string    `json:"apn,omitempty"`
 	Realm             string    `json:"realm,omitempty"`
+	Username          string    `json:"username,omitempty"`
+	EAPIdentity       string    `json:"eap_identity,omitempty"`
+	CallingStationID  string    `json:"calling_station_id,omitempty"`
+	CalledStationID   string    `json:"called_station_id,omitempty"`
+	NASIP             string    `json:"nas_ip,omitempty"`
+	NASIdentifier     string    `json:"nas_identifier,omitempty"`
+	AcctSessionID     string    `json:"acct_session_id,omitempty"`
+	RadiusState       string    `json:"radius_state,omitempty"`
+	RadiusClass       []byte    `json:"radius_class,omitempty"`
+	ConnectInfo       string    `json:"connect_info,omitempty"`
+	FramedMTU         uint32    `json:"framed_mtu,omitempty"`
 	SubscriberIP      net.IP    `json:"subscriber_ip,omitempty"`
 	GatewayIP         net.IP    `json:"gateway_ip,omitempty"`
 	AccessType        string    `json:"access_type,omitempty"`
@@ -69,11 +80,16 @@ type RecoveryTombstone struct {
 	OldRemoteTEID    uint32           `json:"old_remote_teid,omitempty"`
 	OldLocalTEID     uint32           `json:"old_local_teid,omitempty"`
 	OriginalUsername string           `json:"original_username,omitempty"`
+	EAPIdentity      string           `json:"eap_identity,omitempty"`
 	RadiusState      string           `json:"radius_state,omitempty"`
 	NASIP            string           `json:"nas_ip,omitempty"`
 	NASIdentifier    string           `json:"nas_identifier,omitempty"`
+	AcctSessionID    string           `json:"acct_session_id,omitempty"`
 	CallingStationID string           `json:"calling_station_id,omitempty"`
+	CalledStationID  string           `json:"called_station_id,omitempty"`
 	Class            []byte           `json:"class,omitempty"`
+	ConnectInfo      string           `json:"connect_info,omitempty"`
+	FramedMTU        uint32           `json:"framed_mtu,omitempty"`
 	Reason           string           `json:"reason,omitempty"`
 	State            RecoveryState    `json:"state"`
 	CreatedAt        time.Time        `json:"created_at"`

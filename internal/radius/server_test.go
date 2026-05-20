@@ -13,6 +13,7 @@ import (
 	"github.com/vectorcore/twag/internal/lifecycle"
 	radiustransport "layeh.com/radius"
 	"layeh.com/radius/rfc2865"
+	"layeh.com/radius/rfc2866"
 	"layeh.com/radius/rfc2868"
 	"layeh.com/radius/rfc2869"
 	"layeh.com/radius/rfc3580"
@@ -34,7 +35,7 @@ func TestEAPRequestUsesConfiguredDefaultsAndRadiusIdentity(t *testing.T) {
 	if err := rfc2869.EAPMessage_Set(p, []byte{2, 1, 0, 10, 1, 'i', 'd', 'e', 'n', 't'}); err != nil {
 		t.Fatalf("set eap message: %v", err)
 	}
-	req := s.eapRequest(p)
+	req := s.eapRequest(p, nil)
 	if req.IMSI != "311435300070580" {
 		t.Fatalf("imsi = %q", req.IMSI)
 	}
@@ -58,7 +59,7 @@ func TestEAPRequestParsesPrefixed3GPPNAIIMSI(t *testing.T) {
 	if err := rfc2869.EAPMessage_Set(p, eapResponseIdentity(1, "0311435000070570@wlan.mnc435.mcc311.3gppnetwork.org")); err != nil {
 		t.Fatalf("set eap message: %v", err)
 	}
-	req := s.eapRequest(p)
+	req := s.eapRequest(p, nil)
 	if req.IMSI != "311435000070570" {
 		t.Fatalf("imsi = %q", req.IMSI)
 	}
@@ -76,12 +77,83 @@ func TestEAPRequestUsesEAPIdentityWhenUserNameMissing(t *testing.T) {
 	if err := rfc2869.EAPMessage_Set(p, eapResponseIdentity(7, "0311435000070570@wlan.mnc435.mcc311.3gppnetwork.org")); err != nil {
 		t.Fatalf("set eap message: %v", err)
 	}
-	req := s.eapRequest(p)
+	req := s.eapRequest(p, nil)
 	if req.IMSI != "311435000070570" {
 		t.Fatalf("imsi = %q", req.IMSI)
 	}
 	if req.Username != "0311435000070570@wlan.mnc435.mcc311.3gppnetwork.org" {
 		t.Fatalf("username = %q", req.Username)
+	}
+}
+
+func TestEAPRequestCapturesRadiusSessionIdentifiers(t *testing.T) {
+	s := New(config.RadiusConfig{}, config.SubscriberConfig{
+		DefaultAPN:   "internet",
+		DefaultRealm: "epc.example",
+	}, nil, slog.New(slog.DiscardHandler))
+	p := radiustransport.New(radiustransport.CodeAccessRequest, []byte("secret"))
+	if err := rfc2865.UserName_SetString(p, "0311435000070570@wlan.mnc435.mcc311.3gppnetwork.org"); err != nil {
+		t.Fatalf("set username: %v", err)
+	}
+	if err := rfc2865.CallingStationID_SetString(p, "AA-BB-CC-DD-EE-01"); err != nil {
+		t.Fatalf("set calling station id: %v", err)
+	}
+	if err := rfc2865.CalledStationID_SetString(p, "11-22-33-44-55-66:lab"); err != nil {
+		t.Fatalf("set called station id: %v", err)
+	}
+	if err := rfc2865.NASIPAddress_Set(p, net.ParseIP("192.0.2.10")); err != nil {
+		t.Fatalf("set nas ip: %v", err)
+	}
+	if err := rfc2865.NASIdentifier_SetString(p, "ap-1"); err != nil {
+		t.Fatalf("set nas identifier: %v", err)
+	}
+	if err := rfc2866.AcctSessionID_SetString(p, "acct-123"); err != nil {
+		t.Fatalf("set acct session id: %v", err)
+	}
+	if err := rfc2865.Class_SetString(p, "class-blob"); err != nil {
+		t.Fatalf("set class: %v", err)
+	}
+	if err := rfc2865.FramedMTU_Set(p, 1400); err != nil {
+		t.Fatalf("set framed mtu: %v", err)
+	}
+	if err := rfc2869.ConnectInfo_SetString(p, "CONNECT 866Mbps"); err != nil {
+		t.Fatalf("set connect info: %v", err)
+	}
+	if err := rfc2869.EAPMessage_Set(p, eapResponseIdentity(7, "0311435000070570@wlan.mnc435.mcc311.3gppnetwork.org")); err != nil {
+		t.Fatalf("set eap message: %v", err)
+	}
+
+	req := s.eapRequest(p, &net.UDPAddr{IP: net.ParseIP("198.51.100.10"), Port: 49152})
+	if req.EAPIdentity != "0311435000070570@wlan.mnc435.mcc311.3gppnetwork.org" {
+		t.Fatalf("eap identity = %q", req.EAPIdentity)
+	}
+	if req.CallingStationID != "AA-BB-CC-DD-EE-01" || req.CalledStationID != "11-22-33-44-55-66:lab" {
+		t.Fatalf("station ids = %q/%q", req.CallingStationID, req.CalledStationID)
+	}
+	if req.NASIP != "192.0.2.10" || req.NASIdentifier != "ap-1" {
+		t.Fatalf("nas = %q/%q", req.NASIP, req.NASIdentifier)
+	}
+	if req.AcctSessionID != "acct-123" || string(req.RadiusClass) != "class-blob" {
+		t.Fatalf("acct/class = %q/%q", req.AcctSessionID, string(req.RadiusClass))
+	}
+	if req.ConnectInfo != "CONNECT 866Mbps" || req.FramedMTU != 1400 {
+		t.Fatalf("connect/mtu = %q/%d", req.ConnectInfo, req.FramedMTU)
+	}
+}
+
+func TestEAPRequestUsesRemoteSourceIPWhenNASIPAddressMissing(t *testing.T) {
+	s := New(config.RadiusConfig{}, config.SubscriberConfig{DefaultAPN: "internet"}, nil, slog.New(slog.DiscardHandler))
+	p := radiustransport.New(radiustransport.CodeAccessRequest, []byte("secret"))
+	if err := rfc2865.UserName_SetString(p, "311435300070580"); err != nil {
+		t.Fatalf("set username: %v", err)
+	}
+	if err := rfc2869.EAPMessage_Set(p, eapResponseIdentity(7, "311435300070580")); err != nil {
+		t.Fatalf("set eap message: %v", err)
+	}
+
+	req := s.eapRequest(p, &net.UDPAddr{IP: net.ParseIP("198.51.100.10"), Port: 49152})
+	if req.NASIP != "198.51.100.10" {
+		t.Fatalf("nas ip = %q", req.NASIP)
 	}
 }
 

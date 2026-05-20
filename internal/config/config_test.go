@@ -64,6 +64,9 @@ func TestDefaultsAndAccessFanout(t *testing.T) {
 	if !cfg.Recovery.Enabled || !cfg.Recovery.ReasonGTPUError {
 		t.Fatalf("session recovery defaults disabled: %#v", cfg.Recovery)
 	}
+	if !cfg.Recovery.RejectOldDHCPIP || cfg.Recovery.DHCPStaleRequestAction != "nak" || cfg.Access.DHCP.StaleRequestAction != "nak" {
+		t.Fatalf("session recovery stale DHCP defaults = %#v effective_dhcp=%q", cfg.Recovery, cfg.Access.DHCP.StaleRequestAction)
+	}
 	if cfg.Recovery.RadiusDisconnect.NASPort != 3799 || cfg.Recovery.RadiusDisconnect.TimeoutSeconds != 3 || cfg.Recovery.RadiusDisconnect.Retries != 2 {
 		t.Fatalf("session recovery radius disconnect defaults = %#v", cfg.Recovery.RadiusDisconnect)
 	}

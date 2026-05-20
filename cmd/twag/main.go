@@ -2,11 +2,9 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
-	"io"
 	"log/slog"
 	"os"
 	"os/signal"
@@ -41,40 +39,16 @@ func main() {
 	var validateOnly bool
 	var showVersion bool
 	var debug bool
-	var testAttachPath string
-	var testDetachPath string
-	var testAttachDetach bool
-	var testAttachHold bool
 
 	flag.StringVar(&cfgPath, "c", "config.yaml", "path to YAML config file")
 	flag.BoolVar(&validateOnly, "validate", false, "load and validate config, then exit")
 	flag.BoolVar(&showVersion, "version", false, "print version and exit")
 	flag.BoolVar(&debug, "d", false, "enable debug console logging")
-	flag.StringVar(&testAttachPath, "test-attach", "", "path to JSON attach request; run one attach lifecycle and exit")
-	flag.StringVar(&testDetachPath, "test-detach", "", "path to JSON detach request; run one detach lifecycle and exit")
-	flag.BoolVar(&testAttachDetach, "test-attach-detach", false, "detach the test attach session before exiting")
-	flag.BoolVar(&testAttachHold, "test-attach-hold", false, "hold a successful test attach until SIGINT/SIGTERM, then detach cleanly")
 	flag.Parse()
 
 	if showVersion {
 		fmt.Fprint(os.Stdout, buildInfo())
 		return
-	}
-	if testAttachDetach && testAttachPath == "" {
-		fmt.Fprintln(os.Stderr, "VectorCore TWAG: -test-attach-detach requires -test-attach")
-		os.Exit(1)
-	}
-	if testAttachHold && testAttachPath == "" {
-		fmt.Fprintln(os.Stderr, "VectorCore TWAG: -test-attach-hold requires -test-attach")
-		os.Exit(1)
-	}
-	if testAttachDetach && testAttachHold {
-		fmt.Fprintln(os.Stderr, "VectorCore TWAG: use either -test-attach-detach or -test-attach-hold, not both")
-		os.Exit(1)
-	}
-	if testAttachPath != "" && testDetachPath != "" {
-		fmt.Fprintln(os.Stderr, "VectorCore TWAG: use either -test-attach or -test-detach, not both")
-		os.Exit(1)
 	}
 
 	cfg, err := config.Load(cfgPath)
@@ -94,13 +68,13 @@ func main() {
 	}
 	defer log.Close() //nolint:errcheck
 
-	if err := run(cfg, log.Logger, testAttachPath, testDetachPath, testAttachDetach, testAttachHold); err != nil {
+	if err := run(cfg, log.Logger); err != nil {
 		log.Error("TWAG failed", "error", err)
 		os.Exit(1)
 	}
 }
 
-func run(cfg *config.Config, log *slog.Logger, testAttachPath, testDetachPath string, testAttachDetach, testAttachHold bool) error {
+func run(cfg *config.Config, log *slog.Logger) error {
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
 
@@ -171,27 +145,6 @@ func run(cfg *config.Config, log *slog.Logger, testAttachPath, testDetachPath st
 		return err
 	}
 
-	if testAttachPath != "" {
-		defer func() {
-			shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 15*time.Second)
-			defer shutdownCancel()
-			if err := stopRuntime(shutdownCtx, log, lifecycleSvc, radiusSrv, accessSide, userPlane, pgwClient, provider, accessDriver); err != nil {
-				log.Warn("TWAG shutdown incomplete", "error", err)
-			}
-		}()
-		return runTestAttach(ctx, lifecycleSvc, log, testAttachPath, testAttachDetach, testAttachHold)
-	}
-	if testDetachPath != "" {
-		defer func() {
-			shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 15*time.Second)
-			defer shutdownCancel()
-			if err := stopRuntime(shutdownCtx, log, lifecycleSvc, radiusSrv, accessSide, userPlane, pgwClient, provider, accessDriver); err != nil {
-				log.Warn("TWAG shutdown incomplete", "error", err)
-			}
-		}()
-		return runTestDetach(ctx, lifecycleSvc, testDetachPath)
-	}
-
 	<-ctx.Done()
 	log.Info("TWAG shutting down", "reason", ctx.Err().Error())
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 15*time.Second)
@@ -239,65 +192,6 @@ func stopRuntime(ctx context.Context, log *slog.Logger, lifecycleSvc *lifecycle.
 	stop("aaa", func(context.Context) error { return provider.Stop() })
 	stop("access_driver", func(context.Context) error { return accessDriver.Stop() })
 	return errors.Join(errs...)
-}
-
-func runTestAttach(parent context.Context, lifecycleSvc *lifecycle.Service, log *slog.Logger, path string, detach, hold bool) error {
-	f, err := os.Open(path)
-	if err != nil {
-		return fmt.Errorf("open test attach request: %w", err)
-	}
-	defer f.Close() //nolint:errcheck
-	var req lifecycle.AttachRequest
-	dec := json.NewDecoder(io.LimitReader(f, 1<<20))
-	dec.DisallowUnknownFields()
-	if err := dec.Decode(&req); err != nil {
-		return fmt.Errorf("parse test attach request: %w", err)
-	}
-	ctx, cancel := context.WithTimeout(parent, 30*time.Second)
-	defer cancel()
-	resp, err := lifecycleSvc.Attach(ctx, req)
-	if resp != nil {
-		_ = json.NewEncoder(os.Stdout).Encode(resp)
-	}
-	if err != nil {
-		return err
-	}
-	if hold {
-		log.Info("test attach hold active", "session_id", resp.SessionID)
-		<-parent.Done()
-		log.Info("test attach hold stopping", "session_id", resp.SessionID, "reason", parent.Err().Error())
-	}
-	if !detach && !hold {
-		return nil
-	}
-	detachCtx, detachCancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer detachCancel()
-	detachResp, detachErr := lifecycleSvc.Detach(detachCtx, lifecycle.DetachRequest{SessionID: resp.SessionID})
-	if detachResp != nil {
-		_ = json.NewEncoder(os.Stdout).Encode(detachResp)
-	}
-	return detachErr
-}
-
-func runTestDetach(parent context.Context, lifecycleSvc *lifecycle.Service, path string) error {
-	f, err := os.Open(path)
-	if err != nil {
-		return fmt.Errorf("open test detach request: %w", err)
-	}
-	defer f.Close() //nolint:errcheck
-	var req lifecycle.DetachRequest
-	dec := json.NewDecoder(io.LimitReader(f, 1<<20))
-	dec.DisallowUnknownFields()
-	if err := dec.Decode(&req); err != nil {
-		return fmt.Errorf("parse test detach request: %w", err)
-	}
-	ctx, cancel := context.WithTimeout(parent, 30*time.Second)
-	defer cancel()
-	resp, err := lifecycleSvc.Detach(ctx, req)
-	if resp != nil {
-		_ = json.NewEncoder(os.Stdout).Encode(resp)
-	}
-	return err
 }
 
 func buildAccess(cfg *config.Config, log *slog.Logger) (access.Driver, error) {

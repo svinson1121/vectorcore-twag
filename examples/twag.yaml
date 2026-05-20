@@ -31,6 +31,10 @@ radius:
   listen_addr: 0.0.0.0:1812
   secret: testing123
   vlan_id: 10
+  access_accept:
+    session_timeout_seconds: 3600
+    termination_action: radius_request
+    idle_timeout_seconds: 0
 
 aaa:
   sta:
@@ -68,7 +72,15 @@ session_recovery:
   cleanup_on_duplicate_attach: true
   allow_same_mac_reattach: true
   reject_old_dhcp_ip: true
-  dhcp_stale_request_action: ignore
+  dhcp_stale_request_action: nak
+  radius_disconnect:
+    enabled: true
+    nas_port: 3799
+    secret: testing123
+    timeout_seconds: 3
+    retries: 2
+    request_type: disconnect
+    fallback_to_recovery_tombstone: true
 
 session_lifecycle:
   duplicate_attach_policy: reuse_existing
