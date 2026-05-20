@@ -24,14 +24,8 @@ type Driver interface {
 }
 
 func NewDriver(cfg config.AccessConfig, log *slog.Logger) (Driver, error) {
-	switch cfg.Mode {
-	case "", ModeEthernet:
-		return NewEthernet(cfg.Interface, log), nil
-	case ModeGRE:
-		return NewGRE(log), nil
-	case ModeL2TPv3:
-		return NewL2TPv3(log), nil
-	default:
-		return nil, fmt.Errorf("unsupported access mode %q", cfg.Mode)
+	if cfg.Interface == "" {
+		return nil, fmt.Errorf("access.interface is required")
 	}
+	return NewEthernet(cfg.Interface, log), nil
 }

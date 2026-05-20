@@ -8,8 +8,8 @@ import (
 func TestMessageEncodeDecode(t *testing.T) {
 	original := message{
 		Flags:       flagRequest | flagProxiable,
-		CommandCode: commandSAR,
-		AppID:       16777265,
+		CommandCode: commandDER,
+		AppID:       16777250,
 		HopByHop:    10,
 		EndToEnd:    20,
 		AVPs: []avp{
@@ -17,7 +17,7 @@ func TestMessageEncodeDecode(t *testing.T) {
 			uint32AVP(avpAuthSessionState, 0, 1),
 			groupedAVP(avpVendorSpecificApplicationID, 0,
 				uint32AVP(avpVendorID, 0, vendor3GPP),
-				uint32AVP(avpAuthApplicationID, 0, 16777265),
+				uint32AVP(avpAuthApplicationID, 0, 16777250),
 			),
 		},
 	}

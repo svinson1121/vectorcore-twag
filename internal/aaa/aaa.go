@@ -14,6 +14,7 @@ type Provider interface {
 	Start(ctx context.Context) error
 	Stop() error
 	Authenticate(ctx context.Context, req AuthRequest) (*AuthResult, error)
+	ExchangeEAP(ctx context.Context, req EAPRequest) (*EAPResult, error)
 	Type() string
 }
 
@@ -24,6 +25,8 @@ type AuthRequest struct {
 	Username   string
 	Realm      string
 	APN        string
+	Ki         string
+	OPc        string
 }
 
 func (r AuthRequest) Validate() error {
@@ -49,21 +52,60 @@ type AuthResult struct {
 	ResultCode   uint32
 }
 
+type EAPState string
+
+const (
+	EAPStateChallenge EAPState = "challenge"
+	EAPStateSuccess   EAPState = "success"
+	EAPStateFailure   EAPState = "failure"
+)
+
+type EAPRequest struct {
+	SessionID  string
+	IMSI       string
+	MSISDN     string
+	MACAddress string
+	Username   string
+	Realm      string
+	APN        string
+	EAPPayload []byte
+}
+
+func (r EAPRequest) Validate() error {
+	if r.IMSI == "" && r.Username == "" && r.MACAddress == "" {
+		return fmt.Errorf("eap request requires imsi, username, or mac address")
+	}
+	if r.APN == "" {
+		return fmt.Errorf("eap request requires apn")
+	}
+	if r.Realm == "" {
+		return fmt.Errorf("eap request requires realm")
+	}
+	if len(r.EAPPayload) == 0 {
+		return fmt.Errorf("eap request requires eap payload")
+	}
+	return nil
+}
+
+type EAPResult struct {
+	SessionID    string
+	State        EAPState
+	Allowed      bool
+	IMSI         string
+	MSISDN       string
+	APN          string
+	SubscriberID string
+	Reason       string
+	ResultCode   uint32
+	EAPPayload   []byte
+	MSK          []byte
+}
+
 var ErrRejected = errors.New("subscriber rejected")
 
-func NewProvider(cfg config.AAAConfig, swx diameter.SWxClient, log *slog.Logger) (Provider, error) {
-	switch cfg.Mode {
-	case "swx":
-		if swx == nil {
-			return nil, fmt.Errorf("swx aaa provider requires swx client")
-		}
-		return NewSWxProvider(swx, log), nil
-	case "static":
-		if log != nil {
-			log.Warn("static AAA provider enabled; use only for local development fallback")
-		}
-		return NewStaticProvider(log), nil
-	default:
-		return nil, fmt.Errorf("unsupported aaa mode %q", cfg.Mode)
+func NewProvider(cfg config.AAAConfig, sta diameter.STaClient, log *slog.Logger) (Provider, error) {
+	if sta == nil {
+		return nil, fmt.Errorf("sta aaa provider requires sta client")
 	}
+	return NewSTaProvider(sta, log), nil
 }

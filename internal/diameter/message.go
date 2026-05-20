@@ -14,9 +14,9 @@ const (
 	diameterVer   byte   = 1
 	headerLen            = 20
 	commandCER    uint32 = 257
+	commandDER    uint32 = 268
 	commandDWR    uint32 = 280
 	commandDPR    uint32 = 282
-	commandSAR    uint32 = 301
 	commandRTR    uint32 = 304
 	commandPPR    uint32 = 305
 )
@@ -33,16 +33,19 @@ const (
 	avpFirmwareRevision            uint32 = 267
 	avpResultCode                  uint32 = 268
 	avpProductName                 uint32 = 269
+	avpAuthRequestType             uint32 = 274
 	avpAuthSessionState            uint32 = 277
 	avpOriginStateID               uint32 = 278
+	avpFailedAVP                   uint32 = 279
 	avpDestinationRealm            uint32 = 283
 	avpDestinationHost             uint32 = 293
 	avpOriginRealm                 uint32 = 296
 	avpExperimentalResult          uint32 = 297
 	avpExperimentalResultCode      uint32 = 298
 	avpInbandSecurityID            uint32 = 299
+	avpEAPPayload                  uint32 = 462
+	avpEAPMasterSessionKey         uint32 = 464
 	avpServiceSelection            uint32 = 493
-	avpServerAssignmentType        uint32 = 614
 )
 
 const (

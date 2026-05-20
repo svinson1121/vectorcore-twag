@@ -4,10 +4,14 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"net"
+	"sync"
 	"testing"
 
 	"github.com/vectorcore/twag/internal/aaa"
 	"github.com/vectorcore/twag/internal/config"
+	"github.com/vectorcore/twag/internal/gtp"
+	"github.com/vectorcore/twag/internal/gtpu"
 	"github.com/vectorcore/twag/internal/ipam"
 	"github.com/vectorcore/twag/internal/pgw"
 	"github.com/vectorcore/twag/internal/routing"
@@ -102,7 +106,7 @@ func TestDetachDeletesPGWRouteAndLease(t *testing.T) {
 	}
 }
 
-func TestDuplicateAttachDetachesExistingSession(t *testing.T) {
+func TestDuplicateAttachReusesExistingActiveSession(t *testing.T) {
 	svc, deps := newTestService(t)
 	first, err := svc.Attach(context.Background(), AttachRequest{
 		IMSI:       "001010000000001",
@@ -118,23 +122,247 @@ func TestDuplicateAttachDetachesExistingSession(t *testing.T) {
 	if err != nil {
 		t.Fatalf("second Attach() error = %v", err)
 	}
+	if first.SessionID != second.SessionID {
+		t.Fatal("duplicate attach should reuse the existing active session")
+	}
+	if second.SubscriberIP != first.SubscriberIP {
+		t.Fatalf("reused subscriber ip = %q, want %q", second.SubscriberIP, first.SubscriberIP)
+	}
+	if deps.pgw.deleted != 0 {
+		t.Fatalf("pgw deletes = %d", deps.pgw.deleted)
+	}
+	if deps.pgw.created != 1 {
+		t.Fatalf("pgw creates = %d", deps.pgw.created)
+	}
+	if _, ok := deps.ipam.Lookup(first.SessionID); !ok {
+		t.Fatal("reused session should keep old IP lease")
+	}
+	if _, ok := deps.sessions.Get(first.SessionID); !ok {
+		t.Fatal("reused session should remain stored")
+	}
+}
+
+func TestDuplicateAttachContinuesWhenOldPGWContextNotFound(t *testing.T) {
+	svc, deps := newTestService(t)
+	svc.cfg.Lifecycle.DuplicateAttachPolicy = "replace_existing"
+	first, err := svc.Attach(context.Background(), AttachRequest{
+		IMSI:       "001010000000001",
+		MACAddress: "aa:bb:cc:dd:ee:01",
+	})
+	if err != nil {
+		t.Fatalf("first Attach() error = %v", err)
+	}
+	deps.pgw.deleteErr = &gtp.GTPError{Operation: "GTP-C Delete Session", Cause: gtp.GTPv2CauseContextNotFound}
+
+	second, err := svc.Attach(context.Background(), AttachRequest{
+		IMSI:       "001010000000001",
+		MACAddress: "aa:bb:cc:dd:ee:01",
+	})
+	if err != nil {
+		t.Fatalf("second Attach() error = %v", err)
+	}
 	if first.SessionID == second.SessionID {
 		t.Fatal("duplicate attach should create a replacement session")
 	}
-	if second.SubscriberIP != "10.200.0.2" {
-		t.Fatalf("replacement subscriber ip = %q", second.SubscriberIP)
+	if second.State != session.Active {
+		t.Fatalf("replacement state = %q", second.State)
 	}
 	if deps.pgw.deleted != 1 {
 		t.Fatalf("pgw deletes = %d", deps.pgw.deleted)
 	}
-	if _, ok := deps.ipam.Lookup(first.SessionID); ok {
-		t.Fatal("duplicate attach should release old IP lease")
+	if deps.pgw.created != 2 {
+		t.Fatalf("pgw creates = %d", deps.pgw.created)
 	}
 	if _, ok := deps.sessions.Get(first.SessionID); ok {
-		t.Fatal("duplicate attach should delete old session")
+		t.Fatal("stale old session should be removed locally")
 	}
-	if _, ok := deps.ipam.Lookup(second.SessionID); !ok {
-		t.Fatal("replacement session should have IP lease")
+	if _, ok := deps.sessions.Get(second.SessionID); !ok {
+		t.Fatal("replacement session should be stored")
+	}
+}
+
+func TestGTPUErrorIndicationCreatesRecoveryTombstoneAndCleansUp(t *testing.T) {
+	svc, deps := newTestService(t)
+	svc.cfg.Recovery = config.RecoveryConfig{Enabled: true, ReasonGTPUError: true, RecoveryWindowSeconds: 60, AllowSameMACReattach: true}
+	resp, err := svc.Attach(context.Background(), AttachRequest{
+		IMSI:       "001010000000001",
+		MACAddress: "aa:bb:cc:dd:ee:01",
+	})
+	if err != nil {
+		t.Fatalf("Attach() error = %v", err)
+	}
+	if _, err := deps.sessions.ApplyPGWResult(resp.SessionID, nil, nil, 0x1001, 0x4e80a8e9, 0x80122006); err != nil {
+		t.Fatalf("ApplyPGWResult() error = %v", err)
+	}
+	if err := svc.HandleGTPUErrorIndication(context.Background(), gtpu.ErrorIndication{
+		RemoteAddr:    &net.UDPAddr{IP: net.ParseIP("10.90.250.92"), Port: 2152},
+		OffendingTEID: 0x80122006,
+	}); err != nil {
+		t.Fatalf("HandleGTPUErrorIndication() error = %v", err)
+	}
+	if deps.pgw.deleted != 1 {
+		t.Fatalf("pgw deletes = %d, want 1", deps.pgw.deleted)
+	}
+	if _, ok := deps.sessions.Get(resp.SessionID); ok {
+		t.Fatal("old session should be deleted after recovery cleanup")
+	}
+	if tombstone, ok := deps.sessions.FindRecovery("001010000000001", "aa:bb:cc:dd:ee:01"); !ok {
+		t.Fatal("expected recovery tombstone")
+	} else if tombstone.OldRemoteTEID != 0x80122006 {
+		t.Fatalf("old remote TEID = %#x", tombstone.OldRemoteTEID)
+	}
+}
+
+func TestFreshAttachCompletesRecovery(t *testing.T) {
+	svc, deps := newTestService(t)
+	svc.cfg.Recovery = config.RecoveryConfig{Enabled: true, ReasonGTPUError: true, RecoveryWindowSeconds: 60, AllowSameMACReattach: true}
+	first, err := svc.Attach(context.Background(), AttachRequest{
+		IMSI:       "001010000000001",
+		MACAddress: "aa:bb:cc:dd:ee:01",
+	})
+	if err != nil {
+		t.Fatalf("first Attach() error = %v", err)
+	}
+	if _, err := deps.sessions.ApplyPGWResult(first.SessionID, nil, nil, 0x1001, 0x4e80a8e9, 0x80122006); err != nil {
+		t.Fatalf("ApplyPGWResult() error = %v", err)
+	}
+	if err := svc.HandleGTPUErrorIndication(context.Background(), gtpu.ErrorIndication{OffendingTEID: 0x80122006}); err != nil {
+		t.Fatalf("HandleGTPUErrorIndication() error = %v", err)
+	}
+	second, err := svc.Attach(context.Background(), AttachRequest{
+		IMSI:       "001010000000001",
+		MACAddress: "aa:bb:cc:dd:ee:01",
+	})
+	if err != nil {
+		t.Fatalf("second Attach() error = %v", err)
+	}
+	if second.SessionID == first.SessionID {
+		t.Fatal("recovery attach should create a fresh session")
+	}
+	if _, ok := deps.sessions.FindRecovery("001010000000001", "aa:bb:cc:dd:ee:01"); ok {
+		t.Fatal("recovery tombstone should be removed after fresh attach")
+	}
+}
+
+func TestDuplicateAttachKeepsOtherDeleteFailuresFatal(t *testing.T) {
+	svc, deps := newTestService(t)
+	svc.cfg.Lifecycle.DuplicateAttachPolicy = "replace_existing"
+	if _, err := svc.Attach(context.Background(), AttachRequest{
+		IMSI:       "001010000000001",
+		MACAddress: "aa:bb:cc:dd:ee:01",
+	}); err != nil {
+		t.Fatalf("first Attach() error = %v", err)
+	}
+	deps.pgw.deleteErr = errors.New("GTP-C transport timeout")
+
+	resp, err := svc.Attach(context.Background(), AttachRequest{
+		IMSI:       "001010000000001",
+		MACAddress: "aa:bb:cc:dd:ee:01",
+	})
+	if err == nil {
+		t.Fatal("expected duplicate attach to fail for non-context-not-found delete error")
+	}
+	if resp != nil {
+		t.Fatalf("unexpected response %#v", resp)
+	}
+	if deps.pgw.deleted != 1 {
+		t.Fatalf("pgw deletes = %d", deps.pgw.deleted)
+	}
+	if deps.pgw.created != 1 {
+		t.Fatalf("pgw creates = %d", deps.pgw.created)
+	}
+}
+
+func TestDuplicateAttachReplacePolicyDetachesBeforeCreate(t *testing.T) {
+	svc, deps := newTestService(t)
+	svc.cfg.Lifecycle.DuplicateAttachPolicy = "replace_existing"
+	first, err := svc.Attach(context.Background(), AttachRequest{
+		IMSI:       "001010000000001",
+		MACAddress: "aa:bb:cc:dd:ee:01",
+	})
+	if err != nil {
+		t.Fatalf("first Attach() error = %v", err)
+	}
+	second, err := svc.Attach(context.Background(), AttachRequest{
+		IMSI:       "001010000000001",
+		MACAddress: "aa:bb:cc:dd:ee:01",
+	})
+	if err != nil {
+		t.Fatalf("second Attach() error = %v", err)
+	}
+	if first.SessionID == second.SessionID {
+		t.Fatal("replace policy should create a replacement session")
+	}
+	if deps.pgw.deleted != 1 {
+		t.Fatalf("pgw deletes = %d", deps.pgw.deleted)
+	}
+	if deps.pgw.created != 2 {
+		t.Fatalf("pgw creates = %d", deps.pgw.created)
+	}
+	if deps.pgw.maxInflightCreates > 1 {
+		t.Fatalf("overlapping creates = %d", deps.pgw.maxInflightCreates)
+	}
+}
+
+func TestConcurrentAttachAndRecoveryDoNotOverlapCreateSession(t *testing.T) {
+	svc, deps := newTestService(t)
+	svc.cfg.Recovery = config.RecoveryConfig{Enabled: true, ReasonGTPUError: true, RecoveryWindowSeconds: 60, AllowSameMACReattach: true}
+	first, err := svc.Attach(context.Background(), AttachRequest{
+		IMSI:       "001010000000001",
+		MACAddress: "aa:bb:cc:dd:ee:01",
+	})
+	if err != nil {
+		t.Fatalf("first Attach() error = %v", err)
+	}
+	if _, err := deps.sessions.ApplyPGWResult(first.SessionID, nil, nil, 0x1001, 0x4e80a8e9, 0x80122006); err != nil {
+		t.Fatalf("ApplyPGWResult() error = %v", err)
+	}
+
+	var wg sync.WaitGroup
+	errs := make(chan error, 4)
+	for i := 0; i < 2; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_, err := svc.AttachAuthorized(context.Background(), AttachRequest{
+				IMSI:       "001010000000001",
+				MACAddress: "aa:bb:cc:dd:ee:01",
+			}, nil)
+			errs <- err
+		}()
+	}
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		errs <- svc.HandleGTPUErrorIndication(context.Background(), gtpu.ErrorIndication{OffendingTEID: 0x80122006})
+	}()
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		_, err := svc.Detach(context.Background(), DetachRequest{SessionID: first.SessionID})
+		if err != nil && err.Error() == "session not found" {
+			err = nil
+		}
+		errs <- err
+	}()
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatalf("concurrent lifecycle error = %v", err)
+		}
+	}
+	if deps.pgw.maxInflightCreates > 1 {
+		t.Fatalf("overlapping creates = %d", deps.pgw.maxInflightCreates)
+	}
+	active := 0
+	for _, sess := range deps.sessions.List() {
+		if sess.State == session.Active {
+			active++
+		}
+	}
+	if active > 1 {
+		t.Fatalf("active sessions = %d", active)
 	}
 }
 
@@ -243,7 +471,6 @@ func newTestService(t *testing.T) (*Service, testDeps) {
 	cfg := &config.Config{
 		TWAG: config.TWAGConfig{Name: "twag-test", Realm: "epc.example"},
 		Access: config.AccessConfig{
-			Mode:      "ethernet",
 			Interface: "eth1",
 		},
 		Subscriber: config.SubscriberConfig{
@@ -286,18 +513,45 @@ func (f *fakeAAA) Type() string                { return "fake" }
 func (f *fakeAAA) Authenticate(context.Context, aaa.AuthRequest) (*aaa.AuthResult, error) {
 	return f.result, f.err
 }
+func (f *fakeAAA) ExchangeEAP(context.Context, aaa.EAPRequest) (*aaa.EAPResult, error) {
+	return &aaa.EAPResult{
+		State:      aaa.EAPStateSuccess,
+		Allowed:    true,
+		IMSI:       f.result.IMSI,
+		MSISDN:     f.result.MSISDN,
+		APN:        f.result.APN,
+		Reason:     f.result.Reason,
+		ResultCode: f.result.ResultCode,
+	}, nil
+}
 
 type fakePGW struct {
-	created   int
-	deleted   int
-	createErr error
-	deleteErr error
+	mu                 sync.Mutex
+	created            int
+	deleted            int
+	inflightCreates    int
+	maxInflightCreates int
+	createErr          error
+	deleteErr          error
 }
 
 func (f *fakePGW) Probe(context.Context) error { return nil }
 
+func (f *fakePGW) StartEchoWatchdog(context.Context) {}
+
 func (f *fakePGW) CreateSession(_ context.Context, sess *session.Session) (*pgw.CreateSessionResult, error) {
+	f.mu.Lock()
 	f.created++
+	f.inflightCreates++
+	if f.inflightCreates > f.maxInflightCreates {
+		f.maxInflightCreates = f.inflightCreates
+	}
+	f.mu.Unlock()
+	defer func() {
+		f.mu.Lock()
+		f.inflightCreates--
+		f.mu.Unlock()
+	}()
 	if f.createErr != nil {
 		return nil, f.createErr
 	}
@@ -308,8 +562,12 @@ func (f *fakePGW) CreateSession(_ context.Context, sess *session.Session) (*pgw.
 }
 
 func (f *fakePGW) DeleteSession(context.Context, *session.Session) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	f.deleted++
 	return f.deleteErr
 }
 
 func (f *fakePGW) Type() string { return "fake" }
+
+func (f *fakePGW) Close() error { return nil }

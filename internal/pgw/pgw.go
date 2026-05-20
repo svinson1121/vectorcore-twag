@@ -3,25 +3,24 @@ package pgw
 import (
 	"context"
 	"errors"
-	"fmt"
 	"log/slog"
 	"net"
 
 	"github.com/vectorcore/twag/internal/config"
+	"github.com/vectorcore/twag/internal/gtp"
 	"github.com/vectorcore/twag/internal/session"
 )
 
-const (
-	ModeStub = "stub"
-	ModeGTP  = "gtp"
-)
+const ModeGTP = "gtp"
 
 var ErrNotImplemented = errors.New("pgw client not implemented")
 
 type Client interface {
 	Probe(ctx context.Context) error
+	StartEchoWatchdog(ctx context.Context)
 	CreateSession(ctx context.Context, sess *session.Session) (*CreateSessionResult, error)
 	DeleteSession(ctx context.Context, sess *session.Session) error
+	Close() error
 	Type() string
 }
 
@@ -35,13 +34,10 @@ type CreateSessionResult struct {
 	RemoteGTPUTEID uint32
 }
 
-func NewClient(cfg config.PGWConfig, log *slog.Logger) (Client, error) {
-	switch cfg.Mode {
-	case "", ModeStub:
-		return NewStub(cfg, log), nil
-	case ModeGTP:
-		return NewGTP(cfg, log)
-	default:
-		return nil, fmt.Errorf("unsupported pgw mode %q", cfg.Mode)
-	}
+func IsContextNotFound(err error) bool {
+	return gtp.IsContextNotFound(err)
+}
+
+func NewClient(cfg config.GTPConfig, log *slog.Logger) (Client, error) {
+	return NewGTP(cfg, cfg, log)
 }

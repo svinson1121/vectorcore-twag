@@ -41,6 +41,32 @@ func TestSessionStateTransitionsAndLookups(t *testing.T) {
 	}
 }
 
+func TestSessionStateTransitionsWithPGWAssignedIP(t *testing.T) {
+	m := NewManager(slog.New(slog.DiscardHandler))
+	s := m.Create(CreateInput{
+		IMSI:       "001010000000001",
+		MSISDN:     "17892000001",
+		MACAddress: "aa:bb:cc:dd:ee:01",
+		APN:        "internet",
+		Realm:      "ims.example",
+		GatewayIP:  net.ParseIP("10.200.0.1"),
+	})
+	mustTransition(t, func() (*Session, error) { return m.MarkAuthPending(s.ID) }, AuthPending)
+	mustTransition(t, func() (*Session, error) { return m.MarkAuthorized(s.ID) }, Authorized)
+	mustTransition(t, func() (*Session, error) { return m.MarkPGWPending(s.ID) }, PGWPending)
+	updated, err := m.UpdateSubscriberIP(s.ID, net.ParseIP("10.200.0.99"))
+	if err != nil {
+		t.Fatalf("UpdateSubscriberIP() error = %v", err)
+	}
+	if !updated.SubscriberIP.Equal(net.ParseIP("10.200.0.99")) {
+		t.Fatalf("subscriber ip = %s", updated.SubscriberIP)
+	}
+	mustTransition(t, func() (*Session, error) { return m.MarkActive(s.ID) }, Active)
+	if _, ok := m.LookupByIP(net.ParseIP("10.200.0.99")); !ok {
+		t.Fatal("missing PGW-assigned IP lookup")
+	}
+}
+
 func TestInvalidTransition(t *testing.T) {
 	m := NewManager(slog.New(slog.DiscardHandler))
 	s := m.Create(CreateInput{IMSI: "001010000000001"})

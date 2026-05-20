@@ -42,10 +42,7 @@ func TestEthernetHonorsCanceledContext(t *testing.T) {
 }
 
 func TestGREStubIsExplicitlyNotImplemented(t *testing.T) {
-	d, err := NewDriver(config.AccessConfig{Mode: ModeGRE}, slog.New(slog.DiscardHandler))
-	if err != nil {
-		t.Fatalf("NewDriver(gre) error = %v", err)
-	}
+	d := NewGRE(slog.New(slog.DiscardHandler))
 	if d.Type() != ModeGRE {
 		t.Fatalf("driver type = %q", d.Type())
 	}
@@ -58,10 +55,7 @@ func TestGREStubIsExplicitlyNotImplemented(t *testing.T) {
 }
 
 func TestL2TPv3StubIsExplicitlyNotImplemented(t *testing.T) {
-	d, err := NewDriver(config.AccessConfig{Mode: ModeL2TPv3}, slog.New(slog.DiscardHandler))
-	if err != nil {
-		t.Fatalf("NewDriver(l2tpv3) error = %v", err)
-	}
+	d := NewL2TPv3(slog.New(slog.DiscardHandler))
 	if d.Type() != ModeL2TPv3 {
 		t.Fatalf("driver type = %q", d.Type())
 	}
@@ -73,9 +67,9 @@ func TestL2TPv3StubIsExplicitlyNotImplemented(t *testing.T) {
 	}
 }
 
-func TestNewDriverRejectsUnknownMode(t *testing.T) {
-	_, err := NewDriver(config.AccessConfig{Mode: "wifi"}, slog.New(slog.DiscardHandler))
+func TestNewDriverRequiresInterface(t *testing.T) {
+	_, err := NewDriver(config.AccessConfig{}, slog.New(slog.DiscardHandler))
 	if err == nil {
-		t.Fatalf("expected unknown mode error")
+		t.Fatalf("expected missing interface error")
 	}
 }

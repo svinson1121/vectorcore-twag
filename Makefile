@@ -9,7 +9,7 @@ COMMIT?=$(shell git rev-parse --short HEAD 2>/dev/null || echo unknown)
 BUILD_DATE?=$(shell date -u +%Y-%m-%dT%H:%M:%SZ)
 LDFLAGS=-X main.version=$(VERSION) -X main.commit=$(COMMIT) -X main.buildDate=$(BUILD_DATE)
 
-.PHONY: build tidy test clean install
+.PHONY: build tidy test test-real-aaa clean install
 
 build:
 	$(GOENV) go build -buildvcs=false -ldflags "$(LDFLAGS)" -o $(BIN_DIR)/$(APP) $(CMD)
@@ -19,6 +19,9 @@ tidy:
 
 test:
 	$(GOENV) go test ./...
+
+test-real-aaa:
+	$(GOENV) go test ./cmd/twag -run TestRealAAAAttach -count=1 -v
 
 clean:
 	rm -rf $(BIN_DIR)

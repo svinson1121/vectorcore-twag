@@ -7,39 +7,78 @@ logging:
   file: /tmp/vectorcore-twag/twag.log
 
 access:
-  mode: ethernet
-  interface: eth1
+  interface: enp0s8
+  gateway_ip: 100.64.0.1
+  netmask: 255.255.255.0
+  dns:
+    - 8.8.8.8
+    - 1.1.1.1
+
+  dhcp:
+    enabled: true
+    lease_time_seconds: 600
+    renewal_time_seconds: 300
+    rebinding_time_seconds: 525
+
+  arp_proxy:
+    enabled: true
+
+  forwarding:
+    enabled: true
+
+radius:
+  enabled: true
+  listen_addr: 0.0.0.0:1812
+  secret: testing123
+  vlan_id: 10
 
 aaa:
-  mode: swx
-  swx:
+  sta:
     origin_host: twag01.epc.mnc435.mcc311.3gppnetwork.org
     origin_realm: epc.mnc435.mcc311.3gppnetwork.org
     destination_realm: epc.mnc435.mcc311.3gppnetwork.org
-    destination_host: hss01.epc.mnc435.mcc311.3gppnetwork.org
+    destination_host: dra01.epc.mnc435.mcc311.3gppnetwork.org
     peer_addr: 10.90.250.35:3868
 
 subscriber:
   default_apn: internet
   default_realm: ims.mnc435.mcc311.3gppnetwork.org
 
-ipam:
-  pool: 10.200.0.0/24
-  gateway: 10.200.0.1
-  dns:
-    - 8.8.8.8
-    - 1.1.1.1
-
-pgw:
-  mode: gtp
+gtp:
   local_gtpc_ip: 10.90.250.186
   local_gtpu_ip: 10.90.250.186
   remote_pgw_gtpc_ip: 10.90.250.92
   remote_pgw_gtpu_ip: 10.90.250.92
   apn: internet
+  charging_characteristics: "0800"
+  kernel_interface: gtp0
+
+  echo:
+    enabled: true
+    interval_seconds: 30
+    timeout_seconds: 5
+    max_failures: 3
+    startup_probe: true
+
+session_recovery:
+  enabled: true
+  reason_gtpu_error_indication: true
+  recovery_window_seconds: 60
+  stale_client_grace_seconds: 10
+  cleanup_on_duplicate_attach: true
+  allow_same_mac_reattach: true
+  reject_old_dhcp_ip: true
+  dhcp_stale_request_action: ignore
+
+session_lifecycle:
+  duplicate_attach_policy: reuse_existing
+  duplicate_attach_cleanup_timeout_seconds: 5
+  suppress_duplicate_create_session: true
+  per_subscriber_lock_timeout_seconds: 10
 
 routing:
   enable_ip_forwarding: true
-  install_routes: true
-  nat_enabled: false
-  nat_interface: eth0
+  disable_rp_filter: true
+  policy_routing: true
+  policy_table: 200
+  policy_priority: 10000
