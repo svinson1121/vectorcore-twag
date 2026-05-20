@@ -104,11 +104,12 @@ func (s *DHCPServer) HandleFrame(frame []byte) []byte {
 		s.log.Info("DHCP Discover received", attrs...)
 		if !authorized {
 			if tombstone, ok := s.sessions.LookupRecoveryByMACAddr(p.ClientMAC); ok {
-				s.log.Info("stale DHCP discover during session recovery",
+				s.log.Info("DHCP discover from recovery client without active PGW session",
 					"mac", p.ClientMAC.String(),
 					"old_ip", ipString(tombstone.OldSubscriberIP),
 					"old_session_id", tombstone.OldSessionID,
-					"action", "ignore",
+					"recovery_state", tombstone.State,
+					"action", "wait_for_radius_reattach",
 				)
 				return nil
 			}
@@ -124,13 +125,21 @@ func (s *DHCPServer) HandleFrame(frame []byte) []byte {
 		if !authorized {
 			requested := firstIP(p.RequestedIP, p.ClientIP)
 			if tombstone, ok := s.sessions.LookupRecoveryByMACAddr(p.ClientMAC); ok {
+				action := s.cfg.StaleRequestAction
+				if action == "" {
+					action = "ignore"
+				}
 				s.log.Info("stale DHCP request during session recovery",
 					"mac", p.ClientMAC.String(),
 					"old_ip", ipString(tombstone.OldSubscriberIP),
 					"requested_ip", ipString(requested),
 					"old_session_id", tombstone.OldSessionID,
-					"action", "ignore",
+					"recovery_state", tombstone.State,
+					"action", action,
 				)
+				if action == "nak" {
+					return s.buildNAK(p)
+				}
 				return nil
 			}
 			s.log.Info("DHCP ignored unauthorized client", "mac", p.ClientMAC.String())

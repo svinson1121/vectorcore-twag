@@ -62,6 +62,7 @@ type DHCPConfig struct {
 	Router                   string   `yaml:"-"`
 	ServerIdentifier         string   `yaml:"-"`
 	DNS                      []string `yaml:"-"`
+	StaleRequestAction       string   `yaml:"-"`
 }
 
 type ARPProxyConfig struct {
@@ -79,10 +80,17 @@ type ForwardingConfig struct {
 }
 
 type RadiusConfig struct {
-	Enabled    bool   `yaml:"enabled"`
-	ListenAddr string `yaml:"listen_addr"`
-	Secret     string `yaml:"secret"`
-	VLANID     int    `yaml:"vlan_id"`
+	Enabled      bool                     `yaml:"enabled"`
+	ListenAddr   string                   `yaml:"listen_addr"`
+	Secret       string                   `yaml:"secret"`
+	VLANID       int                      `yaml:"vlan_id"`
+	AccessAccept RadiusAccessAcceptConfig `yaml:"access_accept"`
+}
+
+type RadiusAccessAcceptConfig struct {
+	SessionTimeoutSeconds int    `yaml:"session_timeout_seconds"`
+	TerminationAction     string `yaml:"termination_action"`
+	IdleTimeoutSeconds    int    `yaml:"idle_timeout_seconds"`
 }
 
 type AAAConfig struct {
@@ -132,14 +140,26 @@ type GTPEchoConfig struct {
 }
 
 type RecoveryConfig struct {
-	Enabled                  bool   `yaml:"enabled"`
-	ReasonGTPUError          bool   `yaml:"reason_gtpu_error_indication"`
-	RecoveryWindowSeconds    int    `yaml:"recovery_window_seconds"`
-	StaleClientGraceSeconds  int    `yaml:"stale_client_grace_seconds"`
-	CleanupOnDuplicateAttach bool   `yaml:"cleanup_on_duplicate_attach"`
-	AllowSameMACReattach     bool   `yaml:"allow_same_mac_reattach"`
-	RejectOldDHCPIP          bool   `yaml:"reject_old_dhcp_ip"`
-	DHCPStaleRequestAction   string `yaml:"dhcp_stale_request_action"`
+	Enabled                  bool                   `yaml:"enabled"`
+	ReasonGTPUError          bool                   `yaml:"reason_gtpu_error_indication"`
+	RecoveryWindowSeconds    int                    `yaml:"recovery_window_seconds"`
+	StaleClientGraceSeconds  int                    `yaml:"stale_client_grace_seconds"`
+	CleanupOnDuplicateAttach bool                   `yaml:"cleanup_on_duplicate_attach"`
+	AllowSameMACReattach     bool                   `yaml:"allow_same_mac_reattach"`
+	RejectOldDHCPIP          bool                   `yaml:"reject_old_dhcp_ip"`
+	DHCPStaleRequestAction   string                 `yaml:"dhcp_stale_request_action"`
+	RadiusDisconnect         RadiusDisconnectConfig `yaml:"radius_disconnect"`
+}
+
+type RadiusDisconnectConfig struct {
+	Enabled                     bool   `yaml:"enabled"`
+	NASIP                       string `yaml:"nas_ip"`
+	NASPort                     int    `yaml:"nas_port"`
+	Secret                      string `yaml:"secret"`
+	TimeoutSeconds              int    `yaml:"timeout_seconds"`
+	Retries                     int    `yaml:"retries"`
+	RequestType                 string `yaml:"request_type"`
+	FallbackToRecoveryTombstone bool   `yaml:"fallback_to_recovery_tombstone"`
 }
 
 type LifecycleConfig struct {
@@ -203,7 +223,7 @@ func Default() *Config {
 				RequireAuthorizedSession: true,
 			},
 		},
-		Radius: RadiusConfig{Enabled: true},
+		Radius: RadiusConfig{Enabled: true, AccessAccept: RadiusAccessAcceptConfig{SessionTimeoutSeconds: 3600, TerminationAction: "radius_request"}},
 		AAA: AAAConfig{
 			STa: STaConfig{
 				VendorID:          STaVendorID,
@@ -211,7 +231,7 @@ func Default() *Config {
 			},
 		},
 		GTP:       GTPConfig{ChargingCharacteristics: "0800", KernelInterface: "gtp0", Echo: GTPEchoConfig{Enabled: true, IntervalSeconds: 30, TimeoutSeconds: 5, MaxFailures: 3, StartupProbe: true}},
-		Recovery:  RecoveryConfig{Enabled: true, ReasonGTPUError: true, RecoveryWindowSeconds: 60, StaleClientGraceSeconds: 10, CleanupOnDuplicateAttach: true, AllowSameMACReattach: true, RejectOldDHCPIP: true, DHCPStaleRequestAction: "ignore"},
+		Recovery:  RecoveryConfig{Enabled: true, ReasonGTPUError: true, RecoveryWindowSeconds: 60, StaleClientGraceSeconds: 10, CleanupOnDuplicateAttach: true, AllowSameMACReattach: true, RejectOldDHCPIP: true, DHCPStaleRequestAction: "ignore", RadiusDisconnect: RadiusDisconnectConfig{NASPort: 3799, TimeoutSeconds: 3, Retries: 2, RequestType: "disconnect", FallbackToRecoveryTombstone: true}},
 		Lifecycle: LifecycleConfig{DuplicateAttachPolicy: "reuse_existing", DuplicateAttachCleanupTimeoutSeconds: 5, SuppressDuplicateCreateSession: true, PerSubscriberLockTimeoutSeconds: 10},
 		Routing:   RoutingConfig{InstallRoutes: true},
 	}
@@ -235,6 +255,7 @@ func (c *Config) ApplyDefaults() {
 	c.Access.DHCP.Router = c.Access.GatewayIP
 	c.Access.DHCP.ServerIdentifier = c.Access.GatewayIP
 	c.Access.DHCP.DNS = append([]string(nil), c.Access.DNS...)
+	c.Access.DHCP.StaleRequestAction = c.Recovery.DHCPStaleRequestAction
 	if c.Access.DHCP.LeaseTimeSeconds == 0 {
 		c.Access.DHCP.LeaseTimeSeconds = 600
 	}
@@ -253,6 +274,12 @@ func (c *Config) ApplyDefaults() {
 	}
 	if c.Radius.VLANID == 0 {
 		c.Radius.VLANID = 10
+	}
+	if c.Radius.AccessAccept.SessionTimeoutSeconds == 0 {
+		c.Radius.AccessAccept.SessionTimeoutSeconds = 3600
+	}
+	if c.Radius.AccessAccept.TerminationAction == "" {
+		c.Radius.AccessAccept.TerminationAction = "radius_request"
 	}
 	if c.GTP.ChargingCharacteristics == "" {
 		c.GTP.ChargingCharacteristics = "0800"
@@ -278,6 +305,20 @@ func (c *Config) ApplyDefaults() {
 	if c.Recovery.DHCPStaleRequestAction == "" {
 		c.Recovery.DHCPStaleRequestAction = "ignore"
 	}
+	c.Access.DHCP.StaleRequestAction = c.Recovery.DHCPStaleRequestAction
+	if c.Recovery.RadiusDisconnect.NASPort == 0 {
+		c.Recovery.RadiusDisconnect.NASPort = 3799
+	}
+	if c.Recovery.RadiusDisconnect.TimeoutSeconds == 0 {
+		c.Recovery.RadiusDisconnect.TimeoutSeconds = 3
+	}
+	if c.Recovery.RadiusDisconnect.Retries == 0 {
+		c.Recovery.RadiusDisconnect.Retries = 2
+	}
+	if c.Recovery.RadiusDisconnect.RequestType == "" {
+		c.Recovery.RadiusDisconnect.RequestType = "disconnect"
+	}
+	c.Recovery.RadiusDisconnect.FallbackToRecoveryTombstone = true
 	if c.Lifecycle.DuplicateAttachPolicy == "" {
 		c.Lifecycle.DuplicateAttachPolicy = "reuse_existing"
 	}
@@ -352,6 +393,15 @@ func (c *Config) Validate() error {
 	if c.Radius.VLANID < 1 || c.Radius.VLANID > 4094 {
 		errs = append(errs, "radius.vlan_id must be between 1 and 4094")
 	}
+	if c.Radius.AccessAccept.SessionTimeoutSeconds <= 0 {
+		errs = append(errs, "radius.access_accept.session_timeout_seconds must be greater than 0")
+	}
+	if c.Radius.AccessAccept.TerminationAction != "radius_request" && c.Radius.AccessAccept.TerminationAction != "default" {
+		errs = append(errs, "radius.access_accept.termination_action must be radius_request or default")
+	}
+	if c.Radius.AccessAccept.IdleTimeoutSeconds < 0 {
+		errs = append(errs, "radius.access_accept.idle_timeout_seconds must be greater than or equal to 0")
+	}
 	errs = append(errs, validateSTa(c.AAA.STa)...)
 	errs = append(errs, validateRequiredIP("gtp.local_gtpc_ip", c.GTP.LocalGTPCIP)...)
 	errs = append(errs, validateRequiredIP("gtp.local_gtpu_ip", c.GTP.LocalGTPUIP)...)
@@ -380,6 +430,26 @@ func (c *Config) Validate() error {
 	}
 	if c.Recovery.DHCPStaleRequestAction != "ignore" && c.Recovery.DHCPStaleRequestAction != "nak" {
 		errs = append(errs, "session_recovery.dhcp_stale_request_action must be ignore or nak")
+	}
+	if c.Recovery.RadiusDisconnect.Enabled {
+		if net.ParseIP(c.Recovery.RadiusDisconnect.NASIP) == nil {
+			errs = append(errs, "session_recovery.radius_disconnect.nas_ip is required and must be a valid IP when enabled")
+		}
+		if c.Recovery.RadiusDisconnect.Secret == "" {
+			errs = append(errs, "session_recovery.radius_disconnect.secret is required when enabled")
+		}
+	}
+	if c.Recovery.RadiusDisconnect.NASPort <= 0 || c.Recovery.RadiusDisconnect.NASPort > 65535 {
+		errs = append(errs, "session_recovery.radius_disconnect.nas_port must be between 1 and 65535")
+	}
+	if c.Recovery.RadiusDisconnect.TimeoutSeconds <= 0 {
+		errs = append(errs, "session_recovery.radius_disconnect.timeout_seconds must be greater than 0")
+	}
+	if c.Recovery.RadiusDisconnect.Retries < 0 {
+		errs = append(errs, "session_recovery.radius_disconnect.retries must be greater than or equal to 0")
+	}
+	if c.Recovery.RadiusDisconnect.RequestType != "disconnect" && c.Recovery.RadiusDisconnect.RequestType != "coa" {
+		errs = append(errs, "session_recovery.radius_disconnect.request_type must be disconnect or coa")
 	}
 	if c.Lifecycle.DuplicateAttachPolicy != "reuse_existing" && c.Lifecycle.DuplicateAttachPolicy != "replace_existing" {
 		errs = append(errs, "session_lifecycle.duplicate_attach_policy must be reuse_existing or replace_existing")

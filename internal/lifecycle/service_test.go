@@ -213,6 +213,84 @@ func TestGTPUErrorIndicationCreatesRecoveryTombstoneAndCleansUp(t *testing.T) {
 	}
 }
 
+func TestGTPUErrorIndicationSendsRadiusDisconnectWhenEnabled(t *testing.T) {
+	svc, deps := newTestService(t)
+	svc.cfg.Recovery = config.RecoveryConfig{
+		Enabled:               true,
+		ReasonGTPUError:       true,
+		RecoveryWindowSeconds: 60,
+		AllowSameMACReattach:  true,
+		RadiusDisconnect: config.RadiusDisconnectConfig{
+			Enabled:                     true,
+			NASIP:                       "192.0.2.10",
+			NASPort:                     3799,
+			Secret:                      "secret",
+			RequestType:                 "disconnect",
+			FallbackToRecoveryTombstone: true,
+		},
+	}
+	da := &fakeDynamicAuthorizer{}
+	svc.SetDynamicAuthorizer(da)
+	resp, err := svc.Attach(context.Background(), AttachRequest{
+		IMSI:       "001010000000001",
+		MACAddress: "aa:bb:cc:dd:ee:01",
+	})
+	if err != nil {
+		t.Fatalf("Attach() error = %v", err)
+	}
+	if _, err := deps.sessions.ApplyPGWResult(resp.SessionID, nil, nil, 0x1001, 0x4e80a8e9, 0x80122006); err != nil {
+		t.Fatalf("ApplyPGWResult() error = %v", err)
+	}
+	if err := svc.HandleGTPUErrorIndication(context.Background(), gtpu.ErrorIndication{OffendingTEID: 0x80122006}); err != nil {
+		t.Fatalf("HandleGTPUErrorIndication() error = %v", err)
+	}
+	if da.calls != 1 {
+		t.Fatalf("dynamic authorization calls = %d, want 1", da.calls)
+	}
+	if tombstone, ok := deps.sessions.FindRecovery("001010000000001", "aa:bb:cc:dd:ee:01"); !ok {
+		t.Fatal("expected recovery tombstone")
+	} else if tombstone.State != session.RecoveryWaitingReauth {
+		t.Fatalf("recovery state = %q", tombstone.State)
+	}
+}
+
+func TestGTPUErrorIndicationDynamicAuthorizationFailureFallsBack(t *testing.T) {
+	svc, deps := newTestService(t)
+	svc.cfg.Recovery = config.RecoveryConfig{
+		Enabled:               true,
+		ReasonGTPUError:       true,
+		RecoveryWindowSeconds: 60,
+		AllowSameMACReattach:  true,
+		RadiusDisconnect: config.RadiusDisconnectConfig{
+			Enabled:                     true,
+			NASIP:                       "192.0.2.10",
+			NASPort:                     3799,
+			Secret:                      "secret",
+			RequestType:                 "disconnect",
+			FallbackToRecoveryTombstone: true,
+		},
+	}
+	svc.SetDynamicAuthorizer(&fakeDynamicAuthorizer{err: errors.New("timeout")})
+	resp, err := svc.Attach(context.Background(), AttachRequest{
+		IMSI:       "001010000000001",
+		MACAddress: "aa:bb:cc:dd:ee:01",
+	})
+	if err != nil {
+		t.Fatalf("Attach() error = %v", err)
+	}
+	if _, err := deps.sessions.ApplyPGWResult(resp.SessionID, nil, nil, 0x1001, 0x4e80a8e9, 0x80122006); err != nil {
+		t.Fatalf("ApplyPGWResult() error = %v", err)
+	}
+	if err := svc.HandleGTPUErrorIndication(context.Background(), gtpu.ErrorIndication{OffendingTEID: 0x80122006}); err != nil {
+		t.Fatalf("HandleGTPUErrorIndication() error = %v", err)
+	}
+	if tombstone, ok := deps.sessions.FindRecovery("001010000000001", "aa:bb:cc:dd:ee:01"); !ok {
+		t.Fatal("expected recovery tombstone")
+	} else if tombstone.State != session.RecoveryFallback {
+		t.Fatalf("recovery state = %q", tombstone.State)
+	}
+}
+
 func TestFreshAttachCompletesRecovery(t *testing.T) {
 	svc, deps := newTestService(t)
 	svc.cfg.Recovery = config.RecoveryConfig{Enabled: true, ReasonGTPUError: true, RecoveryWindowSeconds: 60, AllowSameMACReattach: true}
@@ -571,3 +649,13 @@ func (f *fakePGW) DeleteSession(context.Context, *session.Session) error {
 func (f *fakePGW) Type() string { return "fake" }
 
 func (f *fakePGW) Close() error { return nil }
+
+type fakeDynamicAuthorizer struct {
+	calls int
+	err   error
+}
+
+func (f *fakeDynamicAuthorizer) DisconnectOrCoA(context.Context, *session.RecoveryTombstone) error {
+	f.calls++
+	return f.err
+}

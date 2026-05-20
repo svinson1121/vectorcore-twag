@@ -79,17 +79,18 @@ type EAPResponse struct {
 }
 
 type Service struct {
-	cfg      *config.Config
-	aaa      aaa.Provider
-	sessions *session.Manager
-	ipam     ipam.IPAM
-	pgw      pgw.Client
-	routing  *routing.Manager
-	user     userplane.UserPlane
-	access   AccessSessionBinder
-	log      *slog.Logger
-	locks    sync.Map
-	counters lifecycleCounters
+	cfg               *config.Config
+	aaa               aaa.Provider
+	sessions          *session.Manager
+	ipam              ipam.IPAM
+	pgw               pgw.Client
+	routing           *routing.Manager
+	user              userplane.UserPlane
+	access            AccessSessionBinder
+	dynamicAuthorizer DynamicAuthorizer
+	log               *slog.Logger
+	locks             sync.Map
+	counters          lifecycleCounters
 }
 
 type lifecycleCounters struct {
@@ -105,6 +106,10 @@ type lifecycleCounters struct {
 type AccessSessionBinder interface {
 	AddSession(ctx context.Context, sess *session.Session) error
 	RemoveSession(ctx context.Context, sess *session.Session) error
+}
+
+type DynamicAuthorizer interface {
+	DisconnectOrCoA(ctx context.Context, tombstone *session.RecoveryTombstone) error
 }
 
 func New(cfg *config.Config, aaaProvider aaa.Provider, sessions *session.Manager, ipam ipam.IPAM, pgwClient pgw.Client, routingMgr *routing.Manager, log *slog.Logger) *Service {
@@ -125,6 +130,10 @@ func (s *Service) SetUserPlane(user userplane.UserPlane) {
 
 func (s *Service) SetAccessSessionBinder(access AccessSessionBinder) {
 	s.access = access
+}
+
+func (s *Service) SetDynamicAuthorizer(authorizer DynamicAuthorizer) {
+	s.dynamicAuthorizer = authorizer
 }
 
 func (s *Service) sessionGatewayIP() net.IP {
@@ -637,8 +646,10 @@ func (s *Service) HandleGTPUErrorIndication(ctx context.Context, ind gtpu.ErrorI
 				"mac", sess.MACAddress,
 				"old_subscriber_ip", ipString(tombstone.OldSubscriberIP),
 				"offending_teid", fmt.Sprintf("0x%08x", ind.OffendingTEID),
+				"recovery_state", tombstone.State,
 				"recovery_window_seconds", s.cfg.Recovery.RecoveryWindowSeconds,
 			)
+			s.attemptDynamicAuthorization(ctx, tombstone)
 		}
 	}
 	s.log.Warn("session cleanup triggered by GTP-U Error Indication",
@@ -663,6 +674,82 @@ func (s *Service) HandleGTPUErrorIndication(ctx context.Context, ind gtpu.ErrorI
 	return nil
 }
 
+func (s *Service) attemptDynamicAuthorization(ctx context.Context, tombstone *session.RecoveryTombstone) {
+	if tombstone == nil {
+		return
+	}
+	if !s.cfg.Recovery.RadiusDisconnect.Enabled || s.dynamicAuthorizer == nil {
+		s.setRecoveryFallback(tombstone, "dynamic_authorization_disabled", "")
+		return
+	}
+	updated, ok := s.sessions.UpdateRecovery(tombstone.OldSessionID, func(t *session.RecoveryTombstone) {
+		t.State = session.RecoveryDisconnecting
+		t.LastAction = s.cfg.Recovery.RadiusDisconnect.RequestType
+		t.NASIP = s.cfg.Recovery.RadiusDisconnect.NASIP
+		if t.CallingStationID == "" && t.MAC != nil {
+			t.CallingStationID = t.MAC.String()
+		}
+		if len(t.Class) == 0 && t.OldSessionID != "" {
+			t.Class = []byte(t.OldSessionID)
+		}
+	})
+	if ok {
+		tombstone = updated
+	}
+	s.log.Info("RADIUS dynamic authorization requested",
+		"old_session_id", tombstone.OldSessionID,
+		"imsi", tombstone.IMSI,
+		"mac", tombstone.MAC.String(),
+		"old_subscriber_ip", ipString(tombstone.OldSubscriberIP),
+		"recovery_state", session.RecoveryDisconnecting,
+		"request_type", s.cfg.Recovery.RadiusDisconnect.RequestType,
+		"nas_ip", s.cfg.Recovery.RadiusDisconnect.NASIP,
+	)
+	if err := s.dynamicAuthorizer.DisconnectOrCoA(ctx, tombstone); err != nil {
+		s.log.Warn("RADIUS dynamic authorization failed; entering fallback recovery tombstone",
+			"old_session_id", tombstone.OldSessionID,
+			"imsi", tombstone.IMSI,
+			"mac", tombstone.MAC.String(),
+			"old_subscriber_ip", ipString(tombstone.OldSubscriberIP),
+			"recovery_state", session.RecoveryFallback,
+			"error", err,
+		)
+		s.setRecoveryFallback(tombstone, "dynamic_authorization_failed", err.Error())
+		return
+	}
+	s.sessions.UpdateRecovery(tombstone.OldSessionID, func(t *session.RecoveryTombstone) {
+		t.State = session.RecoveryWaitingReauth
+		t.LastAction = "dynamic_authorization_accepted"
+		t.LastError = ""
+	})
+	s.log.Info("RADIUS dynamic authorization accepted; waiting for UE reauth",
+		"old_session_id", tombstone.OldSessionID,
+		"imsi", tombstone.IMSI,
+		"mac", tombstone.MAC.String(),
+		"old_subscriber_ip", ipString(tombstone.OldSubscriberIP),
+		"recovery_state", session.RecoveryWaitingReauth,
+	)
+}
+
+func (s *Service) setRecoveryFallback(tombstone *session.RecoveryTombstone, action, lastError string) {
+	if tombstone == nil {
+		return
+	}
+	if !s.cfg.Recovery.RadiusDisconnect.FallbackToRecoveryTombstone {
+		s.sessions.UpdateRecovery(tombstone.OldSessionID, func(t *session.RecoveryTombstone) {
+			t.State = session.RecoveryExpired
+			t.LastAction = action
+			t.LastError = lastError
+		})
+		return
+	}
+	s.sessions.UpdateRecovery(tombstone.OldSessionID, func(t *session.RecoveryTombstone) {
+		t.State = session.RecoveryFallback
+		t.LastAction = action
+		t.LastError = lastError
+	})
+}
+
 func (s *Service) logRecoveryAttachIfPresent(req AttachRequest) (*session.RecoveryTombstone, bool) {
 	if !s.cfg.Recovery.Enabled || !s.cfg.Recovery.AllowSameMACReattach {
 		return nil, false
@@ -671,11 +758,12 @@ func (s *Service) logRecoveryAttachIfPresent(req AttachRequest) (*session.Recove
 	if !ok {
 		return nil, false
 	}
-	s.log.Info("fresh attach accepted during recovery window",
+	s.log.Info("fresh RADIUS/EAP reauth observed during session recovery",
 		"imsi", req.IMSI,
 		"mac", req.MACAddress,
 		"old_session_id", t.OldSessionID,
 		"old_subscriber_ip", ipString(t.OldSubscriberIP),
+		"recovery_state", t.State,
 	)
 	return t, true
 }
@@ -692,7 +780,7 @@ func (s *Service) completeRecovery(created *session.Session, resp *AttachRespons
 		return
 	}
 	if completed, ok := s.sessions.CompleteRecoveryFor(active); ok {
-		s.log.Info("session recovery completed",
+		s.log.Info("session recovery completed after RADIUS reauth",
 			"old_session_id", completed.OldSessionID,
 			"new_session_id", active.ID,
 			"old_subscriber_ip", ipString(completed.OldSubscriberIP),

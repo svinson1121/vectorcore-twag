@@ -5,6 +5,7 @@ import (
 	"log/slog"
 	"net"
 	"testing"
+	"time"
 
 	"github.com/vectorcore/twag/internal/config"
 	"github.com/vectorcore/twag/internal/session"
@@ -65,6 +66,48 @@ func TestDHCPRequestWrongIPNAK(t *testing.T) {
 		t.Fatal("expected DHCP nak")
 	}
 	assertDHCPReply(t, reply, dhcpNak, "0.0.0.0")
+}
+
+func TestDHCPRequestOldIPDuringRecoveryNAKWhenConfigured(t *testing.T) {
+	mgr := session.NewManager(slog.New(slog.DiscardHandler))
+	old := addActiveSession(t, mgr, "f0:5c:77:e8:72:9e", "100.64.0.204")
+	if _, ok := mgr.AddRecoveryTombstone(old, "test recovery", time.Minute); !ok {
+		t.Fatal("expected recovery tombstone")
+	}
+	terminating, err := mgr.MarkTerminating(old.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := mgr.Delete(terminating.ID); !ok {
+		t.Fatal("expected old session delete")
+	}
+	srv := testDHCPServer(mgr)
+	srv.cfg.StaleRequestAction = "nak"
+	reply := srv.HandleFrame(testDHCPClientFrame(t, dhcpRequest, 0x1005, "f0:5c:77:e8:72:9e", net.ParseIP("100.64.0.204")))
+	if len(reply) == 0 {
+		t.Fatal("expected DHCP nak")
+	}
+	assertDHCPReply(t, reply, dhcpNak, "0.0.0.0")
+}
+
+func TestDHCPDiscoverDuringRecoveryDoesNotOffer(t *testing.T) {
+	mgr := session.NewManager(slog.New(slog.DiscardHandler))
+	old := addActiveSession(t, mgr, "f0:5c:77:e8:72:9e", "100.64.0.204")
+	if _, ok := mgr.AddRecoveryTombstone(old, "test recovery", time.Minute); !ok {
+		t.Fatal("expected recovery tombstone")
+	}
+	terminating, err := mgr.MarkTerminating(old.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := mgr.Delete(terminating.ID); !ok {
+		t.Fatal("expected old session delete")
+	}
+	srv := testDHCPServer(mgr)
+	reply := srv.HandleFrame(testDHCPClientFrame(t, dhcpDiscover, 0x1006, "f0:5c:77:e8:72:9e", nil))
+	if len(reply) != 0 {
+		t.Fatalf("recovery discover produced %d-byte reply", len(reply))
+	}
 }
 
 func testDHCPServer(mgr *session.Manager) *DHCPServer {

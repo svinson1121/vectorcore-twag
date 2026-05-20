@@ -20,6 +20,18 @@ const (
 	Failed      State = "failed"
 )
 
+type RecoveryState string
+
+const (
+	RecoveryNone          RecoveryState = "none"
+	RecoveryRequired      RecoveryState = "recovery_required"
+	RecoveryDisconnecting RecoveryState = "disconnecting"
+	RecoveryWaitingReauth RecoveryState = "waiting_reauth"
+	RecoveryFallback      RecoveryState = "fallback_tombstone"
+	RecoveryCompleted     RecoveryState = "completed"
+	RecoveryExpired       RecoveryState = "expired"
+)
+
 type Session struct {
 	ID                string    `json:"id"`
 	IMSI              string    `json:"imsi,omitempty"`
@@ -49,14 +61,23 @@ type Session struct {
 }
 
 type RecoveryTombstone struct {
-	MAC             net.HardwareAddr `json:"mac,omitempty"`
-	IMSI            string           `json:"imsi,omitempty"`
-	APN             string           `json:"apn,omitempty"`
-	OldSubscriberIP net.IP           `json:"old_subscriber_ip,omitempty"`
-	OldSessionID    string           `json:"old_session_id,omitempty"`
-	OldRemoteTEID   uint32           `json:"old_remote_teid,omitempty"`
-	OldLocalTEID    uint32           `json:"old_local_teid,omitempty"`
-	Reason          string           `json:"reason,omitempty"`
-	CreatedAt       time.Time        `json:"created_at"`
-	ExpiresAt       time.Time        `json:"expires_at"`
+	MAC              net.HardwareAddr `json:"mac,omitempty"`
+	IMSI             string           `json:"imsi,omitempty"`
+	APN              string           `json:"apn,omitempty"`
+	OldSubscriberIP  net.IP           `json:"old_subscriber_ip,omitempty"`
+	OldSessionID     string           `json:"old_session_id,omitempty"`
+	OldRemoteTEID    uint32           `json:"old_remote_teid,omitempty"`
+	OldLocalTEID     uint32           `json:"old_local_teid,omitempty"`
+	OriginalUsername string           `json:"original_username,omitempty"`
+	RadiusState      string           `json:"radius_state,omitempty"`
+	NASIP            string           `json:"nas_ip,omitempty"`
+	NASIdentifier    string           `json:"nas_identifier,omitempty"`
+	CallingStationID string           `json:"calling_station_id,omitempty"`
+	Class            []byte           `json:"class,omitempty"`
+	Reason           string           `json:"reason,omitempty"`
+	State            RecoveryState    `json:"state"`
+	CreatedAt        time.Time        `json:"created_at"`
+	ExpiresAt        time.Time        `json:"expires_at"`
+	LastAction       string           `json:"last_action,omitempty"`
+	LastError        string           `json:"last_error,omitempty"`
 }

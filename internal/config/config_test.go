@@ -40,6 +40,12 @@ func TestDefaultsAndAccessFanout(t *testing.T) {
 	if cfg.Radius.VLANID != 10 {
 		t.Fatalf("radius.vlan_id default = %d", cfg.Radius.VLANID)
 	}
+	if cfg.Radius.AccessAccept.SessionTimeoutSeconds != 3600 {
+		t.Fatalf("radius access accept session timeout default = %d", cfg.Radius.AccessAccept.SessionTimeoutSeconds)
+	}
+	if cfg.Radius.AccessAccept.TerminationAction != "radius_request" {
+		t.Fatalf("radius access accept termination action default = %q", cfg.Radius.AccessAccept.TerminationAction)
+	}
 	if !cfg.GTP.Echo.Enabled || !cfg.GTP.Echo.StartupProbe {
 		t.Fatalf("gtp echo defaults disabled: %#v", cfg.GTP.Echo)
 	}
@@ -57,6 +63,9 @@ func TestDefaultsAndAccessFanout(t *testing.T) {
 	}
 	if !cfg.Recovery.Enabled || !cfg.Recovery.ReasonGTPUError {
 		t.Fatalf("session recovery defaults disabled: %#v", cfg.Recovery)
+	}
+	if cfg.Recovery.RadiusDisconnect.NASPort != 3799 || cfg.Recovery.RadiusDisconnect.TimeoutSeconds != 3 || cfg.Recovery.RadiusDisconnect.Retries != 2 {
+		t.Fatalf("session recovery radius disconnect defaults = %#v", cfg.Recovery.RadiusDisconnect)
 	}
 	if cfg.Lifecycle.DuplicateAttachPolicy != "reuse_existing" {
 		t.Fatalf("duplicate attach policy default = %q", cfg.Lifecycle.DuplicateAttachPolicy)

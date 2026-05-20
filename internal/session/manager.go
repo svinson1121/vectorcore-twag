@@ -357,6 +357,7 @@ func (m *Manager) AddRecoveryTombstone(sess *Session, reason string, ttl time.Du
 		OldRemoteTEID:   sess.RemoteGTPUTEID,
 		OldLocalTEID:    sess.LocalGTPUTEID,
 		Reason:          reason,
+		State:           RecoveryRequired,
 		CreatedAt:       now,
 		ExpiresAt:       now.Add(ttl),
 	}
@@ -365,6 +366,39 @@ func (m *Manager) AddRecoveryTombstone(sess *Session, reason string, ttl time.Du
 			t.MAC = append(net.HardwareAddr(nil), mac...)
 		}
 	}
+	m.indexRecoveryLocked(t)
+	return cloneRecovery(t), true
+}
+
+func (m *Manager) UpdateRecovery(oldSessionID string, fn func(*RecoveryTombstone)) (*RecoveryTombstone, bool) {
+	if oldSessionID == "" {
+		return nil, false
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var t *RecoveryTombstone
+	for _, candidate := range m.recoveryByMAC {
+		if candidate.OldSessionID == oldSessionID {
+			t = candidate
+			break
+		}
+	}
+	if t == nil {
+		for _, candidate := range m.recoveryByIMSI {
+			if candidate.OldSessionID == oldSessionID {
+				t = candidate
+				break
+			}
+		}
+	}
+	if m.recoveryExpiredLocked(t) {
+		return nil, false
+	}
+	if t == nil {
+		return nil, false
+	}
+	m.unindexRecoveryLocked(t)
+	fn(t)
 	m.indexRecoveryLocked(t)
 	return cloneRecovery(t), true
 }
@@ -645,6 +679,7 @@ func cloneRecovery(t *RecoveryTombstone) *RecoveryTombstone {
 	cp := *t
 	cp.MAC = append(net.HardwareAddr(nil), t.MAC...)
 	cp.OldSubscriberIP = cloneIP(t.OldSubscriberIP)
+	cp.Class = append([]byte(nil), t.Class...)
 	return &cp
 }
 

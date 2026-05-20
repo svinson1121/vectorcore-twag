@@ -141,6 +141,7 @@ func run(cfg *config.Config, log *slog.Logger, testAttachPath, testDetachPath st
 	routingMgr := routing.New(cfg.Routing, log)
 	lifecycleSvc := lifecycle.New(cfg, provider, sessionMgr, nil, pgwClient, routingMgr, log)
 	lifecycleSvc.SetUserPlane(userPlane)
+	lifecycleSvc.SetDynamicAuthorizer(radiusserver.NewDynamicAuthorizer(cfg.Recovery.RadiusDisconnect, log))
 	userPlane.SetErrorIndicationHandler(func(ctx context.Context, ind gtpu.ErrorIndication) {
 		if err := lifecycleSvc.HandleGTPUErrorIndication(ctx, ind); err != nil {
 			log.Warn("GTP-U Error Indication cleanup failed", "error", err)

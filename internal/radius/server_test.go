@@ -198,6 +198,39 @@ func TestHandleAccessRequestAcceptIncludesConfiguredVLANTunnelAttributes(t *test
 	}
 }
 
+func TestHandleAccessRequestAcceptIncludesSessionLifetimeAttributes(t *testing.T) {
+	service := &fakeEAPService{resp: &lifecycle.EAPResponse{
+		SessionID:    "sess-1",
+		State:        "success",
+		IMSI:         "311435300070580",
+		SubscriberIP: "100.64.0.10",
+		APN:          "internet",
+	}}
+	s := New(config.RadiusConfig{AccessAccept: config.RadiusAccessAcceptConfig{
+		SessionTimeoutSeconds: 300,
+		TerminationAction:     "radius_request",
+		IdleTimeoutSeconds:    60,
+	}}, config.SubscriberConfig{DefaultAPN: "internet"}, service, slog.New(slog.DiscardHandler))
+	reqPacket := accessRequestPacket(t)
+	writer := &captureWriter{}
+	s.handle(writer, &radiustransport.Request{
+		RemoteAddr: &net.UDPAddr{IP: net.ParseIP("192.0.2.10"), Port: 50000},
+		Packet:     reqPacket,
+	})
+	if writer.packet == nil {
+		t.Fatal("expected response packet")
+	}
+	if got := rfc2865.SessionTimeout_Get(writer.packet); got != rfc2865.SessionTimeout(300) {
+		t.Fatalf("session timeout = %s", got)
+	}
+	if got := rfc2865.TerminationAction_Get(writer.packet); got != rfc2865.TerminationAction_Value_RADIUSRequest {
+		t.Fatalf("termination action = %s", got)
+	}
+	if got := rfc2865.IdleTimeout_Get(writer.packet); got != rfc2865.IdleTimeout(60) {
+		t.Fatalf("idle timeout = %s", got)
+	}
+}
+
 func TestHandleAccessRequestAcceptIncludesMPPEKeysAndValidMessageAuthenticator(t *testing.T) {
 	msk := make([]byte, 64)
 	for i := range msk {

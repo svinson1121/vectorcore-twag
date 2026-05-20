@@ -182,6 +182,10 @@ func (s *Server) handle(w radiustransport.ResponseWriter, r *radiustransport.Req
 	if resp != nil && resp.SessionID != "" {
 		_ = rfc2865.Class_SetString(accept, resp.SessionID)
 	}
+	if err := s.addAccessAcceptLifetime(accept); err != nil {
+		s.reject(w, r, req, err.Error())
+		return
+	}
 	if err := addVLAN(accept, s.cfg.VLANID); err != nil {
 		s.reject(w, r, req, err.Error())
 		return
@@ -223,9 +227,38 @@ func (s *Server) handle(w radiustransport.ResponseWriter, r *radiustransport.Req
 		"mac", req.MACAddress,
 		"subscriber_ip", eapStringValue(resp, func(r *lifecycle.EAPResponse) string { return r.SubscriberIP }),
 		"vlan_id", s.cfg.VLANID,
+		"session_timeout_seconds", s.cfg.AccessAccept.SessionTimeoutSeconds,
+		"termination_action", s.cfg.AccessAccept.TerminationAction,
+		"idle_timeout_seconds", s.cfg.AccessAccept.IdleTimeoutSeconds,
 		"has_message_authenticator", hasMessageAuthenticator(accept),
 	)
 	_ = w.Write(accept)
+}
+
+func (s *Server) addAccessAcceptLifetime(packet *radiustransport.Packet) error {
+	if s.cfg.AccessAccept.SessionTimeoutSeconds > 0 {
+		if err := rfc2865.SessionTimeout_Set(packet, rfc2865.SessionTimeout(s.cfg.AccessAccept.SessionTimeoutSeconds)); err != nil {
+			return fmt.Errorf("set radius session timeout: %w", err)
+		}
+	}
+	switch s.cfg.AccessAccept.TerminationAction {
+	case "", "radius_request":
+		if err := rfc2865.TerminationAction_Set(packet, rfc2865.TerminationAction_Value_RADIUSRequest); err != nil {
+			return fmt.Errorf("set radius termination action: %w", err)
+		}
+	case "default":
+		if err := rfc2865.TerminationAction_Set(packet, rfc2865.TerminationAction_Value_Default); err != nil {
+			return fmt.Errorf("set radius termination action: %w", err)
+		}
+	default:
+		return fmt.Errorf("unsupported radius termination action %q", s.cfg.AccessAccept.TerminationAction)
+	}
+	if s.cfg.AccessAccept.IdleTimeoutSeconds > 0 {
+		if err := rfc2865.IdleTimeout_Set(packet, rfc2865.IdleTimeout(s.cfg.AccessAccept.IdleTimeoutSeconds)); err != nil {
+			return fmt.Errorf("set radius idle timeout: %w", err)
+		}
+	}
+	return nil
 }
 
 func addVLAN(packet *radiustransport.Packet, vlanID int) error {

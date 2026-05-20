@@ -74,6 +74,7 @@ func (p *ARPProxy) HandleFrame(frame []byte) []byte {
 				"sender_ip", req.SenderIP.String(),
 				"target_ip", req.TargetIP.String(),
 				"old_session_id", tombstone.OldSessionID,
+				"recovery_state", tombstone.State,
 				"action", "no_reply",
 			)
 		}
