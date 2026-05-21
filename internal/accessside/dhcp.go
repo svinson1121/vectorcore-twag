@@ -1,9 +1,11 @@
 package accessside
 
 import (
+	"context"
 	"encoding/binary"
 	"log/slog"
 	"net"
+	"sync"
 	"time"
 
 	"github.com/vectorcore/twag/internal/config"
@@ -39,7 +41,14 @@ type DHCPServer struct {
 	conn     packetConn
 	done     chan struct{}
 	leases   map[string]Lease
+
+	ctx              context.Context
+	recoveryHandler  RecoveryAttachHandler
+	recoveryMu       sync.Mutex
+	recoveryAttempts map[string]time.Time
 }
+
+type RecoveryAttachHandler func(context.Context, *session.RecoveryTombstone)
 
 type Lease struct {
 	SessionID    string
@@ -49,13 +58,21 @@ type Lease struct {
 }
 
 func NewDHCPServer(cfg config.DHCPConfig, sessions *session.Manager, log *slog.Logger) *DHCPServer {
-	return &DHCPServer{cfg: cfg, sessions: sessions, log: log, leases: make(map[string]Lease)}
+	return &DHCPServer{cfg: cfg, sessions: sessions, log: log, leases: make(map[string]Lease), recoveryAttempts: make(map[string]time.Time)}
 }
 
-func (s *DHCPServer) Start() error {
+func (s *DHCPServer) SetRecoveryAttachHandler(handler RecoveryAttachHandler) {
+	s.recoveryHandler = handler
+}
+
+func (s *DHCPServer) Start(ctx context.Context) error {
 	if !s.cfg.Enabled {
 		return nil
 	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	s.ctx = ctx
 	conn, ifi, err := openPacketSocket(s.cfg.Interface, etherTypeIPv4)
 	if err != nil {
 		return err
@@ -109,8 +126,9 @@ func (s *DHCPServer) HandleFrame(frame []byte) []byte {
 					"old_ip", ipString(tombstone.OldSubscriberIP),
 					"old_session_id", tombstone.OldSessionID,
 					"recovery_state", tombstone.State,
-					"action", "wait_for_radius_reattach",
+					"action", "trigger_recovery_reattach",
 				)
+				s.triggerRecoveryAttach(tombstone)
 				return nil
 			}
 			s.log.Info("DHCP ignored unauthorized client", "mac", p.ClientMAC.String())
@@ -161,6 +179,32 @@ func (s *DHCPServer) HandleFrame(frame []byte) []byte {
 	default:
 		return nil
 	}
+}
+
+func (s *DHCPServer) triggerRecoveryAttach(tombstone *session.RecoveryTombstone) {
+	if tombstone == nil || s.recoveryHandler == nil {
+		return
+	}
+	key := tombstone.OldSessionID
+	if key == "" && tombstone.MAC != nil {
+		key = tombstone.MAC.String()
+	}
+	if key == "" {
+		return
+	}
+	now := time.Now()
+	s.recoveryMu.Lock()
+	if last := s.recoveryAttempts[key]; !last.IsZero() && now.Sub(last) < 5*time.Second {
+		s.recoveryMu.Unlock()
+		return
+	}
+	s.recoveryAttempts[key] = now
+	s.recoveryMu.Unlock()
+	ctx := s.ctx
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	go s.recoveryHandler(ctx, tombstone)
 }
 
 func (s *DHCPServer) authorizedSession(mac net.HardwareAddr) (*session.Session, bool) {

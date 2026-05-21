@@ -484,7 +484,7 @@ func (k *KernelGTP) runUserEchoProbe(ctx context.Context) error {
 		latency := obs.At.Sub(start)
 		k.recordUserEchoSuccess(latency)
 		k.log.Info("GTP-U echo response observed",
-			"mode", k.userEchoCfg.Mode,
+			"mode", mode,
 			"gtpu_peer_health", k.UserEchoHealth().Health,
 			"remote_pgw_gtpu_ip", obs.Peer.IP.String(),
 			"sequence", obs.Sequence,

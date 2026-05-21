@@ -40,11 +40,17 @@ func New(cfg *config.Config, sessions *session.Manager, log *slog.Logger) *Manag
 	}
 }
 
-func (m *Manager) Start(context.Context) error {
+func (m *Manager) SetRecoveryAttachHandler(handler RecoveryAttachHandler) {
+	if m.dhcp != nil {
+		m.dhcp.SetRecoveryAttachHandler(handler)
+	}
+}
+
+func (m *Manager) Start(ctx context.Context) error {
 	if m.cfg == nil {
 		return nil
 	}
-	if err := m.dhcp.Start(); err != nil {
+	if err := m.dhcp.Start(ctx); err != nil {
 		return err
 	}
 	if err := m.arp.Start(); err != nil {

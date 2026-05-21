@@ -211,6 +211,7 @@ func (s *Service) Attach(ctx context.Context, req AttachRequest) (*AttachRespons
 		AccessType:       "ethernet",
 		AccessInterface:  s.cfg.Access.Interface,
 		GatewayIP:        s.sessionGatewayIP(),
+		TTL:              s.radiusSessionTTL(),
 	})
 	if _, err := s.sessions.MarkAuthPending(sess.ID); err != nil {
 		return nil, err
@@ -336,6 +337,7 @@ func (s *Service) AttachAuthorized(ctx context.Context, req AttachRequest, auth 
 		AccessType:       "ethernet",
 		AccessInterface:  s.cfg.Access.Interface,
 		GatewayIP:        s.sessionGatewayIP(),
+		TTL:              s.radiusSessionTTL(),
 	})
 	if _, err := s.sessions.MarkAuthPending(sess.ID); err != nil {
 		return nil, err
@@ -700,7 +702,8 @@ func (s *Service) HandleGTPUErrorIndication(ctx context.Context, ind gtpu.ErrorI
 		sess = recovering
 	}
 	if s.cfg.Recovery.Enabled && s.cfg.Recovery.ReasonGTPUError {
-		tombstone, ok := s.sessions.AddRecoveryTombstone(sess, reason, time.Duration(s.cfg.Recovery.RecoveryWindowSeconds)*time.Second)
+		recoveryTTL := s.recoveryTombstoneTTL(sess)
+		tombstone, ok := s.sessions.AddRecoveryTombstone(sess, reason, recoveryTTL)
 		if ok {
 			s.log.Warn("session recovery pending after GTP-U Error Indication",
 				"session_id", sess.ID,
@@ -709,7 +712,7 @@ func (s *Service) HandleGTPUErrorIndication(ctx context.Context, ind gtpu.ErrorI
 				"old_subscriber_ip", ipString(tombstone.OldSubscriberIP),
 				"offending_teid", fmt.Sprintf("0x%08x", ind.OffendingTEID),
 				"recovery_state", tombstone.State,
-				"recovery_window_seconds", s.cfg.Recovery.RecoveryWindowSeconds,
+				"recovery_window_seconds", int(recoveryTTL.Seconds()),
 			)
 			s.attemptDynamicAuthorization(ctx, tombstone)
 		}
@@ -734,6 +737,59 @@ func (s *Service) HandleGTPUErrorIndication(ctx context.Context, ind gtpu.ErrorI
 		return err
 	}
 	return nil
+}
+
+func (s *Service) RecoverFromTombstone(ctx context.Context, t *session.RecoveryTombstone) (*AttachResponse, error) {
+	if t == nil {
+		return nil, fmt.Errorf("recovery tombstone is required")
+	}
+	if t.MAC == nil || t.IMSI == "" {
+		return nil, fmt.Errorf("recovery tombstone missing MAC or IMSI")
+	}
+	req := AttachRequest{
+		IMSI:             t.IMSI,
+		MACAddress:       t.MAC.String(),
+		Username:         t.OriginalUsername,
+		EAPIdentity:      t.EAPIdentity,
+		APN:              t.APN,
+		CallingStationID: t.CallingStationID,
+		CalledStationID:  t.CalledStationID,
+		NASIP:            t.NASIP,
+		NASIdentifier:    t.NASIdentifier,
+		AcctSessionID:    t.AcctSessionID,
+		RadiusState:      t.RadiusState,
+		RadiusClass:      t.Class,
+		ConnectInfo:      t.ConnectInfo,
+		FramedMTU:        t.FramedMTU,
+	}
+	s.log.Info("recovery reattach triggered from authorized MAC",
+		"old_session_id", t.OldSessionID,
+		"imsi", t.IMSI,
+		"mac", t.MAC.String(),
+		"old_subscriber_ip", ipString(t.OldSubscriberIP),
+		"recovery_state", t.State,
+	)
+	return s.AttachAuthorized(ctx, req, &aaa.AuthResult{
+		Allowed: true,
+		IMSI:    t.IMSI,
+		APN:     t.APN,
+		Reason:  "radius_session_recovery",
+	})
+}
+
+func (s *Service) radiusSessionTTL() time.Duration {
+	return time.Duration(s.cfg.Radius.AccessAccept.SessionTimeoutSeconds) * time.Second
+}
+
+func (s *Service) recoveryTombstoneTTL(sess *session.Session) time.Duration {
+	ttl := time.Duration(s.cfg.Recovery.RecoveryWindowSeconds) * time.Second
+	if sess != nil && !sess.ExpiresAt.IsZero() {
+		remaining := time.Until(sess.ExpiresAt)
+		if remaining > ttl {
+			return remaining
+		}
+	}
+	return ttl
 }
 
 func (s *Service) attemptDynamicAuthorization(ctx context.Context, tombstone *session.RecoveryTombstone) {

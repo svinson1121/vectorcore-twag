@@ -121,6 +121,22 @@ func run(cfg *config.Config, log *slog.Logger) error {
 			log.Warn("GTP-U Error Indication cleanup failed", "error", err)
 		}
 	})
+	accessSide.SetRecoveryAttachHandler(func(ctx context.Context, tombstone *session.RecoveryTombstone) {
+		recoverCtx, cancel := context.WithTimeout(ctx, 45*time.Second)
+		defer cancel()
+		if _, err := lifecycleSvc.RecoverFromTombstone(recoverCtx, tombstone); err != nil {
+			mac := ""
+			if tombstone.MAC != nil {
+				mac = tombstone.MAC.String()
+			}
+			log.Warn("recovery reattach failed",
+				"old_session_id", tombstone.OldSessionID,
+				"imsi", tombstone.IMSI,
+				"mac", mac,
+				"error", err,
+			)
+		}
+	})
 	lifecycleSvc.SetAccessSessionBinder(accessSide)
 	radiusSrv := radiusserver.New(cfg.Radius, cfg.Subscriber, lifecycleSvc, log)
 
