@@ -5,6 +5,7 @@ VectorCore TWAG is a Trusted WLAN Access Gateway implementation for lab and carr
 The current implementation is focused on trusted non-3GPP WLAN access where the UE authenticates through an AP using RADIUS/EAP, the TWAG exchanges EAP-AKA′ with the AAA/HSS path, creates a PGW session, receives a subscriber IP address, and provides the UE with DHCP/ARP/access forwarding into the GTP user-plane path.
 
 ---
+![Alt FDIgram](https://github.com/svinson1121/vectorcore-aaa/blob/main/images/TWAG.png)
 
 ## Status
 
