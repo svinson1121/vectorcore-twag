@@ -15,6 +15,8 @@ Currently implemented or being validated:
 - RADIUS server for WPA2/WPA3 Enterprise AP integration
 - EAP-AKA′ authentication over Diameter STa
 - RADIUS Access-Challenge / Access-Accept flow
+- RADIUS Accounting listener and Accounting-Start/Stop correlation
+- RADIUS authentication cache for cached 802.1X / PMK reconnect recovery
 - MPPE key export for 802.1X
 - RADIUS VLAN assignment
 - PGW GTP-C Create Session / Delete Session
@@ -29,13 +31,14 @@ Currently implemented or being validated:
 - GTP-U Error Indication handling
 - Session recovery tombstones
 - RADIUS Disconnect / CoA recovery using the learned per-session AP/NAS source IP
+- AAA-initiated STa ASR/STR cleanup path
 - Duplicate Create Session / StarOS context-replacement protection
+- Post-activation datapath validation
 - Graceful shutdown improvements
 
 Items still being hardened:
 
 - GTP-U Echo support through Linux kernel GTP generic netlink where supported, with safe fallback to the kernel-registered GTP-U socket
-- Post-activation user-plane health checks
 - Broader AP compatibility testing
 - Long-duration stability testing
 
@@ -51,6 +54,7 @@ UE
 Wi-Fi AP / NAS
  |
  | RADIUS Access-Request / Access-Challenge / Access-Accept
+ | RADIUS Accounting-Start / Interim / Stop
  |
 VectorCore TWAG
  |
@@ -103,6 +107,10 @@ On EAP success, TWAG sends RADIUS Access-Accept with:
 - Session-Timeout / Termination-Action when configured
 
 Access-Accept is only sent after PGW Create Session succeeds and local GTP, routing, DHCP/ARP, and access bindings are ready.
+
+TWAG also keeps a RADIUS authentication cache keyed primarily by MAC + IMSI + APN. This cache is separate from the active PGW/GTP data session. Accounting-Stop clears the active data session by default, but the authentication cache remains valid until the RADIUS Session-Timeout expires unless `radius.accounting.clear_auth_cache_on_stop` is enabled.
+
+This matters for AP/UE behavior that reuses cached 802.1X authorization or PMK state after Wi-Fi disable/enable. In that case the AP may send Accounting-Start without a fresh Access-Request/EAP exchange. TWAG treats Accounting-Start as an AP-side session-start signal, and if valid authentication cache exists, it rebuilds PGW/GTP/routing/access state before DHCP is allowed.
 
 ### Diameter STa
 
@@ -181,6 +189,7 @@ access:
 
   dhcp:
     enabled: true
+    recover_from_auth_cache: true
     lease_time_seconds: 600
     renewal_time_seconds: 300
     rebinding_time_seconds: 525
@@ -197,10 +206,34 @@ radius:
   secret: testing123
   vlan_id: 10
 
+  allowed_source_subnets:
+    - 192.168.105.0/24
+
+  auth_cache:
+    enabled: true
+    default_ttl_seconds: 3600
+    max_ttl_seconds: 86400
+
   access_accept:
     session_timeout_seconds: 3600
     termination_action: radius_request
     idle_timeout_seconds: 0
+
+  accounting:
+    enabled: true
+    listen_addr: 0.0.0.0:1813
+    secret: testing123
+    clear_session_on_stop: true
+    clear_auth_cache_on_stop: false
+    interim_update_liveness: true
+    accounting_off_action: mark_at_risk
+    start_without_session_action: recover_if_auth_valid
+    start_without_auth_action: disconnect
+
+  dynamic_authorization:
+    default_port: 3799
+    secret: testing123
+    prefer_discovered_nas: true
 
 aaa:
   sta:
@@ -248,6 +281,11 @@ session_recovery:
   reject_old_dhcp_ip: true
   dhcp_stale_request_action: nak
 
+  accounting_start_recovery:
+    enabled: true
+    cooldown_seconds: 10
+    max_attempts_per_minute: 3
+
   radius_disconnect:
     enabled: true
     nas_port: 3799
@@ -255,6 +293,8 @@ session_recovery:
     timeout_seconds: 3
     retries: 2
     request_type: disconnect
+    wait_for_accounting_stop: true
+    accounting_stop_timeout_seconds: 10
     fallback_to_recovery_tombstone: true
 
 session_lifecycle:
@@ -262,6 +302,10 @@ session_lifecycle:
   duplicate_attach_cleanup_timeout_seconds: 5
   suppress_duplicate_create_session: true
   per_subscriber_lock_timeout_seconds: 10
+  post_activation_validation:
+    enabled: true
+    fail_action: trigger_recovery
+    first_packet_timeout_seconds: 0
 
 routing:
   enable_ip_forwarding: true
@@ -319,6 +363,54 @@ Session-Timeout
 Termination-Action = RADIUS-Request
 ```
 
+### RADIUS Accounting
+
+TWAG can listen for RADIUS Accounting on UDP/1813.
+
+Important Accounting status types:
+
+```text
+Accounting-Start
+Accounting-Interim-Update
+Accounting-Stop
+Accounting-On
+Accounting-Off
+```
+
+Accounting-Start is used to bind AP/NAS accounting state to the active TWAG session. Accounting-Stop is treated as authoritative evidence that the AP-side client session ended, so TWAG clears the active PGW/GTP/routing/access/DHCP/ARP state for the matched session.
+
+Accounting-Stop does not necessarily mean the UE or AP discarded cached 802.1X/PMK authorization. By default, TWAG keeps the RADIUS authentication cache after Accounting-Stop:
+
+```yaml
+radius:
+  accounting:
+    clear_session_on_stop: true
+    clear_auth_cache_on_stop: false
+```
+
+This lets a later Accounting-Start rebuild the data session if the cached authorization is still within Session-Timeout.
+
+### RADIUS Authentication Cache
+
+The authentication cache records successful RADIUS/EAP authorization separately from active PGW/GTP session state.
+
+Primary cache key:
+
+```text
+MAC + IMSI + APN
+```
+
+The cache expires based on the RADIUS Session-Timeout returned in Access-Accept. If no explicit value is available, TWAG uses:
+
+```yaml
+radius:
+  auth_cache:
+    default_ttl_seconds: 3600
+    max_ttl_seconds: 86400
+```
+
+DHCP does not use this cache as direct authorization. DHCP still requires an active PGW/GTP session with a subscriber IP. The cache only allows TWAG to trigger a recovery attach and recreate the active session.
+
 ### RADIUS Disconnect / CoA
 
 TWAG can use RADIUS Dynamic Authorization to force AP-side reauthentication when TWAG has lost the PGW/GTP session.
@@ -372,6 +464,42 @@ If the AP does not support this, TWAG falls back to recovery tombstone behavior 
 5. TWAG removes access binding.
 6. TWAG releases DHCP/access state.
 7. Session is marked terminated.
+```
+
+### Cached 802.1X / PMK Reconnect
+
+Some AP/UE combinations reuse cached 802.1X authorization after Wi-Fi is disabled and re-enabled. In that case the AP may send a new Accounting-Start without a fresh Access-Request/EAP exchange.
+
+TWAG handles that case as:
+
+```text
+1. UE disconnects or disables Wi-Fi.
+2. AP sends Accounting-Stop.
+3. TWAG clears active PGW/GTP/routing/access/DHCP/ARP state.
+4. TWAG keeps the RADIUS auth cache until Session-Timeout expires.
+5. UE reconnects using cached 802.1X/PMK authorization.
+6. AP sends Accounting-Start without fresh EAP.
+7. TWAG finds valid auth cache for MAC + IMSI + APN.
+8. TWAG creates a new PGW session.
+9. TWAG installs kernel GTP, routing, and access bindings.
+10. TWAG binds the new Acct-Session-Id to the recovered TWAG session.
+11. DHCP is allowed only after the recovered session is active.
+```
+
+Expected recovery logs:
+
+```text
+Accounting-Start without active TWAG session; valid auth cache found, triggering recovery attach
+Accounting session bound to recovered TWAG session
+Accounting-Start recovery completed
+```
+
+If no valid auth cache exists, TWAG does not create PGW/GTP state and can send RADIUS Disconnect/CoA depending on:
+
+```yaml
+radius:
+  accounting:
+    start_without_auth_action: disconnect
 ```
 
 ### Failure Recovery
@@ -517,6 +645,7 @@ routing table updates
 policy routing
 IP forwarding / rp_filter changes
 UDP 1812 RADIUS listen
+UDP 1813 RADIUS Accounting listen
 GTP-C/GTP-U sockets
 ```
 
@@ -564,7 +693,7 @@ ip route get 8.8.8.8 from <subscriber-ip>
 ### Check RADIUS / EAP
 
 ```bash
-tcpdump -ni any -s 0 -w /tmp/twag-radius.pcap 'udp port 1812'
+tcpdump -ni any -s 0 -w /tmp/twag-radius.pcap 'udp port 1812 or udp port 1813'
 ```
 
 Expected sequence:
@@ -576,6 +705,7 @@ Access-Request
 Access-Challenge
 Access-Request
 Access-Accept
+Accounting-Start
 ```
 
 ### Check GTP-C
@@ -678,6 +808,8 @@ possible causes:
 ```text
 UE/AP still thinks 802.1X is authorized but TWAG removed PGW session.
 Recovery tombstone exists.
+RADIUS auth cache expired or was cleared.
+Accounting-Start was not received or was dropped by allowed_source_subnets.
 RADIUS Disconnect/CoA failed, is not enabled, or the AP does not allow TWAG as a dynamic authorization client.
 UE has not re-run EAP yet.
 ```
@@ -688,6 +820,8 @@ Recommended fix path:
 Enable RADIUS Disconnect/CoA if AP supports it.
 Allow TWAG's RADIUS source IP as a dynamic authorization client on the AP/controller.
 Set Session-Timeout and Termination-Action in Access-Accept.
+Enable RADIUS Accounting on the AP/controller and point it at TWAG UDP/1813.
+Keep radius.accounting.clear_auth_cache_on_stop=false when AP/UE cached PMK reconnect is expected.
 Ensure recovery tombstone logs distinguish stale recovery clients from truly unauthorized clients.
 ```
 
@@ -807,6 +941,7 @@ access forwarding neighbor installed
 session active
 PGW session ready; sending RADIUS Access-Accept
 RADIUS Access-Accept sent
+RADIUS Accounting-Start received
 DHCP Ack sent
 ARP proxy reply sent
 ```
@@ -830,6 +965,18 @@ session recovery pending
 RADIUS Disconnect-Request sent for session recovery
 fresh RADIUS/EAP reauth observed
 session recovery completed
+```
+
+Cached 802.1X / PMK reconnect:
+
+```text
+RADIUS Accounting-Stop received; clearing TWAG session
+RADIUS Accounting-Stop processed; active session cleared but auth cache retained
+RADIUS Accounting-Start received session_id=""
+Accounting-Start without active TWAG session; valid auth cache found, triggering recovery attach
+Accounting session bound to recovered TWAG session
+Accounting-Start recovery completed
+DHCP Ack sent
 ```
 
 Duplicate attach protection:
