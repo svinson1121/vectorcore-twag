@@ -59,14 +59,14 @@ gtp:
 
   control_echo:
     enabled: true
-    interval_seconds: 30
+    interval_seconds: 60
     timeout_seconds: 5
     max_failures: 3
     startup_probe: true
   user_echo:
     enabled: true
     mode: kernel_netlink
-    interval_seconds: 30
+    interval_seconds: 60
     timeout_seconds: 5
     max_failures: 3
     startup_probe: true

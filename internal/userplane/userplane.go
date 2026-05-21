@@ -98,7 +98,31 @@ type KernelGTP struct {
 }
 
 func NewKernelGTP(cfg config.UserPlaneConfig, pgw config.PGWConfig, routing config.RoutingConfig, log *slog.Logger) *KernelGTP {
-	return &KernelGTP{cfg: cfg, pgw: pgw, userEchoCfg: pgw.UserEcho, routing: routing, log: log, gtpuHealth: "unknown"}
+	return &KernelGTP{cfg: cfg, pgw: pgw, userEchoCfg: normalizeUserEchoConfig(pgw.UserEcho, log), routing: routing, log: log, gtpuHealth: "unknown"}
+}
+
+func normalizeUserEchoConfig(cfg config.GTPUserEchoConfig, log *slog.Logger) config.GTPUserEchoConfig {
+	if cfg.Mode == "" {
+		cfg.Mode = gtpUEchoModeKernelNetlink
+	}
+	if cfg.IntervalSeconds == 0 {
+		cfg.IntervalSeconds = config.MinGTPEchoIntervalSeconds
+	} else if cfg.IntervalSeconds > 0 && cfg.IntervalSeconds < config.MinGTPEchoIntervalSeconds {
+		if log != nil {
+			log.Warn("GTP-U echo interval below minimum; clamping",
+				"configured_interval_seconds", cfg.IntervalSeconds,
+				"effective_interval_seconds", config.MinGTPEchoIntervalSeconds,
+			)
+		}
+		cfg.IntervalSeconds = config.MinGTPEchoIntervalSeconds
+	}
+	if cfg.TimeoutSeconds == 0 {
+		cfg.TimeoutSeconds = 5
+	}
+	if cfg.MaxFailures == 0 {
+		cfg.MaxFailures = 3
+	}
+	return cfg
 }
 
 func (k *KernelGTP) Start(ctx context.Context) error {

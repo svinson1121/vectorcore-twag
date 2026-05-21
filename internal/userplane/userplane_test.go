@@ -46,6 +46,24 @@ func TestKernelGTPAddSessionRequiresStart(t *testing.T) {
 	}
 }
 
+func TestUserEchoConfigClampsIntervalBelowMinimum(t *testing.T) {
+	up := NewKernelGTP(config.UserPlaneConfig{
+		Mode:         ModeKernelGTP,
+		GTPInterface: "gtp0",
+	}, config.PGWConfig{
+		UserEcho: config.GTPUserEchoConfig{
+			Enabled:         true,
+			Mode:            gtpUEchoModeKernelNetlink,
+			IntervalSeconds: 1,
+			TimeoutSeconds:  1,
+			MaxFailures:     3,
+		},
+	}, config.RoutingConfig{}, slog.New(slog.DiscardHandler))
+	if up.userEchoCfg.IntervalSeconds != config.MinGTPEchoIntervalSeconds {
+		t.Fatalf("user echo interval = %d, want %d", up.userEchoCfg.IntervalSeconds, config.MinGTPEchoIntervalSeconds)
+	}
+}
+
 func TestKernelSessionValidation(t *testing.T) {
 	if err := validateKernelSession(nil); err == nil {
 		t.Fatal("expected nil session error")

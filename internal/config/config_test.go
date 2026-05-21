@@ -49,13 +49,13 @@ func TestDefaultsAndAccessFanout(t *testing.T) {
 	if !cfg.GTP.ControlEcho.Enabled || !cfg.GTP.ControlEcho.StartupProbe {
 		t.Fatalf("gtp control echo defaults disabled: %#v", cfg.GTP.ControlEcho)
 	}
-	if cfg.GTP.ControlEcho.IntervalSeconds != 30 || cfg.GTP.ControlEcho.TimeoutSeconds != 5 || cfg.GTP.ControlEcho.MaxFailures != 3 {
+	if cfg.GTP.ControlEcho.IntervalSeconds != MinGTPEchoIntervalSeconds || cfg.GTP.ControlEcho.TimeoutSeconds != 5 || cfg.GTP.ControlEcho.MaxFailures != 3 {
 		t.Fatalf("unexpected gtp control echo defaults: %#v", cfg.GTP.ControlEcho)
 	}
 	if cfg.GTP.UserEcho.Enabled {
 		t.Fatalf("gtp user echo default enabled: %#v", cfg.GTP.UserEcho)
 	}
-	if cfg.GTP.UserEcho.Mode != "kernel_netlink" || cfg.GTP.UserEcho.IntervalSeconds != 30 || cfg.GTP.UserEcho.TimeoutSeconds != 5 || cfg.GTP.UserEcho.MaxFailures != 3 {
+	if cfg.GTP.UserEcho.Mode != "kernel_netlink" || cfg.GTP.UserEcho.IntervalSeconds != MinGTPEchoIntervalSeconds || cfg.GTP.UserEcho.TimeoutSeconds != 5 || cfg.GTP.UserEcho.MaxFailures != 3 {
 		t.Fatalf("unexpected gtp user echo defaults: %#v", cfg.GTP.UserEcho)
 	}
 	if cfg.GTP.KernelInterface != "gtp0" {
@@ -107,7 +107,7 @@ radius:
 	if cfg.GTP.ControlEcho.Enabled {
 		t.Fatal("gtp.control_echo.enabled = true, want false")
 	}
-	if cfg.GTP.ControlEcho.IntervalSeconds != 10 || cfg.GTP.ControlEcho.TimeoutSeconds != 2 || cfg.GTP.ControlEcho.MaxFailures != 4 {
+	if cfg.GTP.ControlEcho.IntervalSeconds != MinGTPEchoIntervalSeconds || cfg.GTP.ControlEcho.TimeoutSeconds != 2 || cfg.GTP.ControlEcho.MaxFailures != 4 {
 		t.Fatalf("unexpected gtp control echo config: %#v", cfg.GTP.ControlEcho)
 	}
 	if cfg.GTP.ControlEcho.StartupProbe {
@@ -174,11 +174,42 @@ gtp:
 radius:
   secret: testing123
 `)
-	if !cfg.GTP.ControlEcho.Enabled || cfg.GTP.ControlEcho.IntervalSeconds != 31 || cfg.GTP.ControlEcho.TimeoutSeconds != 6 || cfg.GTP.ControlEcho.MaxFailures != 4 || !cfg.GTP.ControlEcho.StartupProbe {
+	if !cfg.GTP.ControlEcho.Enabled || cfg.GTP.ControlEcho.IntervalSeconds != MinGTPEchoIntervalSeconds || cfg.GTP.ControlEcho.TimeoutSeconds != 6 || cfg.GTP.ControlEcho.MaxFailures != 4 || !cfg.GTP.ControlEcho.StartupProbe {
 		t.Fatalf("control echo = %#v", cfg.GTP.ControlEcho)
 	}
-	if !cfg.GTP.UserEcho.Enabled || cfg.GTP.UserEcho.Mode != "kernel_netlink" || cfg.GTP.UserEcho.IntervalSeconds != 17 || cfg.GTP.UserEcho.TimeoutSeconds != 3 || cfg.GTP.UserEcho.MaxFailures != 2 || !cfg.GTP.UserEcho.StartupProbe {
+	if !cfg.GTP.UserEcho.Enabled || cfg.GTP.UserEcho.Mode != "kernel_netlink" || cfg.GTP.UserEcho.IntervalSeconds != MinGTPEchoIntervalSeconds || cfg.GTP.UserEcho.TimeoutSeconds != 3 || cfg.GTP.UserEcho.MaxFailures != 2 || !cfg.GTP.UserEcho.StartupProbe {
 		t.Fatalf("user echo = %#v", cfg.GTP.UserEcho)
+	}
+}
+
+func TestGTPEchoIntervalBelowMinimumIsClampedAndWarned(t *testing.T) {
+	cfg := mustLoadYAML(t, baseConfigNoGTP()+`
+gtp:
+  local_gtpc_ip: 127.0.0.1
+  local_gtpu_ip: 127.0.0.1
+  remote_pgw_gtpc_ip: 127.0.0.2
+  remote_pgw_gtpu_ip: 127.0.0.2
+  control_echo:
+    enabled: true
+    interval_seconds: 59
+  user_echo:
+    enabled: true
+    mode: kernel_netlink
+    interval_seconds: 1
+radius:
+  secret: testing123
+`)
+	if cfg.GTP.ControlEcho.IntervalSeconds != MinGTPEchoIntervalSeconds {
+		t.Fatalf("control echo interval = %d, want %d", cfg.GTP.ControlEcho.IntervalSeconds, MinGTPEchoIntervalSeconds)
+	}
+	if cfg.GTP.UserEcho.IntervalSeconds != MinGTPEchoIntervalSeconds {
+		t.Fatalf("user echo interval = %d, want %d", cfg.GTP.UserEcho.IntervalSeconds, MinGTPEchoIntervalSeconds)
+	}
+	got := strings.Join(cfg.Warnings, "\n")
+	for _, want := range []string{"gtp.control_echo.interval_seconds", "gtp.user_echo.interval_seconds"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("warnings %q missing %q", got, want)
+		}
 	}
 }
 

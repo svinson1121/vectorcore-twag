@@ -52,6 +52,17 @@ func TestEchoSuccessMarksPeerHealthy(t *testing.T) {
 	}
 }
 
+func TestEchoConfigClampsIntervalBelowMinimum(t *testing.T) {
+	client := newTestGTPClient(t, silentUDPAddr(t), config.GTPEchoConfig{
+		IntervalSeconds: 1,
+		TimeoutSeconds:  1,
+		MaxFailures:     3,
+	})
+	if client.echoCfg.IntervalSeconds != config.MinGTPEchoIntervalSeconds {
+		t.Fatalf("echo interval = %d, want %d", client.echoCfg.IntervalSeconds, config.MinGTPEchoIntervalSeconds)
+	}
+}
+
 func TestEchoTimeoutIncrementsFailureCount(t *testing.T) {
 	client := newTestGTPClient(t, silentUDPAddr(t), config.GTPEchoConfig{MaxFailures: 3})
 	client.peerHealth = PeerHealthHealthy

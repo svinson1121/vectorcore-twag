@@ -5,7 +5,6 @@ VectorCore TWAG is a Trusted WLAN Access Gateway implementation for lab and carr
 The current implementation is focused on trusted non-3GPP WLAN access where the UE authenticates through an AP using RADIUS/EAP, the TWAG exchanges EAP-AKA′ with the AAA/HSS path, creates a PGW session, receives a subscriber IP address, and provides the UE with DHCP/ARP/access forwarding into the GTP user-plane path.
 
 ---
-![Alt FDIgram](https://github.com/svinson1121/vectorcore-aaa/blob/main/images/TWAG.png)
 
 ## Status
 
@@ -226,14 +225,14 @@ gtp:
 
   control_echo:
     enabled: true
-    interval_seconds: 30
+    interval_seconds: 60
     timeout_seconds: 5
     max_failures: 3
     startup_probe: true
   user_echo:
     enabled: true
     mode: kernel_netlink
-    interval_seconds: 30
+    interval_seconds: 60
     timeout_seconds: 5
     max_failures: 3
     startup_probe: true
@@ -421,6 +420,7 @@ Do not rely on PGW context replacement as normal behavior.
 ### GTP-C Echo
 
 TWAG sends periodic GTP-C Echo Requests and handles PGW-initiated GTP-C Echo Requests.
+TWAG enforces a minimum outbound GTP-C/GTP-U Echo interval of 60 seconds; shorter configured intervals are clamped and logged as warnings.
 
 Expected logs:
 

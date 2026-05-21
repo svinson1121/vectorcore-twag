@@ -80,6 +80,9 @@ func run(cfg *config.Config, log *slog.Logger) error {
 
 	log.Info("TWAG starting", "version", version, "name", cfg.TWAG.Name, "realm", cfg.TWAG.Realm)
 	log.Info("config loaded")
+	for _, warning := range cfg.Warnings {
+		log.Warn("config warning", "warning", warning)
+	}
 	log.Info("logging initialized", "level", cfg.Logging.Level, "file", cfg.Logging.File)
 
 	staClient := diameter.NewSTaClient(cfg.AAA.STa, log)

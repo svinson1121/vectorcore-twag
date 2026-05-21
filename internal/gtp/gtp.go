@@ -80,7 +80,7 @@ type gtpcTransaction struct {
 }
 
 func NewGTP(cfg config.PGWConfig, echoCfg config.GTPEchoConfig, log *slog.Logger) (*GTPClient, error) {
-	echoCfg = normalizeEchoConfig(echoCfg)
+	echoCfg = normalizeEchoConfig(echoCfg, log)
 	localIP := net.ParseIP(cfg.LocalGTPCIP)
 	if localIP == nil {
 		return nil, fmt.Errorf("pgw.local_gtpc_ip is invalid")
@@ -185,9 +185,17 @@ func (c *GTPClient) CreateSession(ctx context.Context, sess *session.Session) (*
 	return result, nil
 }
 
-func normalizeEchoConfig(cfg config.GTPEchoConfig) config.GTPEchoConfig {
+func normalizeEchoConfig(cfg config.GTPEchoConfig, log *slog.Logger) config.GTPEchoConfig {
 	if cfg.IntervalSeconds == 0 {
-		cfg.IntervalSeconds = 30
+		cfg.IntervalSeconds = config.MinGTPEchoIntervalSeconds
+	} else if cfg.IntervalSeconds > 0 && cfg.IntervalSeconds < config.MinGTPEchoIntervalSeconds {
+		if log != nil {
+			log.Warn("GTP-C echo interval below minimum; clamping",
+				"configured_interval_seconds", cfg.IntervalSeconds,
+				"effective_interval_seconds", config.MinGTPEchoIntervalSeconds,
+			)
+		}
+		cfg.IntervalSeconds = config.MinGTPEchoIntervalSeconds
 	}
 	if cfg.TimeoutSeconds == 0 {
 		cfg.TimeoutSeconds = 5

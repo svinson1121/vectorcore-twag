@@ -14,6 +14,8 @@ import (
 const (
 	STaVendorID          uint32 = 10415
 	STaAuthApplicationID uint32 = 16777250
+
+	MinGTPEchoIntervalSeconds = 60
 )
 
 type Config struct {
@@ -28,6 +30,7 @@ type Config struct {
 	Lifecycle  LifecycleConfig  `yaml:"session_lifecycle"`
 	Routing    RoutingConfig    `yaml:"routing"`
 	IPAM       IPAMConfig       `yaml:"-"`
+	Warnings   []string         `yaml:"-"`
 }
 
 type TWAGConfig struct {
@@ -264,7 +267,7 @@ func Default() *Config {
 				AuthApplicationID: STaAuthApplicationID,
 			},
 		},
-		GTP:       GTPConfig{ChargingCharacteristics: "0800", KernelInterface: "gtp0", ControlEcho: GTPEchoConfig{Enabled: true, IntervalSeconds: 30, TimeoutSeconds: 5, MaxFailures: 3, StartupProbe: true}, UserEcho: GTPUserEchoConfig{Mode: "kernel_netlink", IntervalSeconds: 30, TimeoutSeconds: 5, MaxFailures: 3}},
+		GTP:       GTPConfig{ChargingCharacteristics: "0800", KernelInterface: "gtp0", ControlEcho: GTPEchoConfig{Enabled: true, IntervalSeconds: MinGTPEchoIntervalSeconds, TimeoutSeconds: 5, MaxFailures: 3, StartupProbe: true}, UserEcho: GTPUserEchoConfig{Mode: "kernel_netlink", IntervalSeconds: MinGTPEchoIntervalSeconds, TimeoutSeconds: 5, MaxFailures: 3}},
 		Recovery:  RecoveryConfig{Enabled: true, ReasonGTPUError: true, RecoveryWindowSeconds: 60, StaleClientGraceSeconds: 10, CleanupOnDuplicateAttach: true, AllowSameMACReattach: true, RejectOldDHCPIP: true, DHCPStaleRequestAction: "nak", RadiusDisconnect: RadiusDisconnectConfig{NASPort: 3799, TimeoutSeconds: 3, Retries: 2, RequestType: "disconnect", FallbackToRecoveryTombstone: true}},
 		Lifecycle: LifecycleConfig{DuplicateAttachPolicy: "reuse_existing", DuplicateAttachCleanupTimeoutSeconds: 5, SuppressDuplicateCreateSession: true, PerSubscriberLockTimeoutSeconds: 10},
 		Routing:   RoutingConfig{InstallRoutes: true},
@@ -272,6 +275,7 @@ func Default() *Config {
 }
 
 func (c *Config) ApplyDefaults() {
+	c.Warnings = nil
 	if c.Logging.Level == "" {
 		c.Logging.Level = "info"
 	}
@@ -324,11 +328,15 @@ func (c *Config) ApplyDefaults() {
 	if c.GTP.legacyEchoSet && !c.GTP.controlEchoSet {
 		c.GTP.ControlEcho = c.GTP.Echo
 	}
-	c.GTP.ControlEcho = normalizeGTPEchoConfig(c.GTP.ControlEcho)
+	controlEchoPath := "gtp.control_echo"
+	if c.GTP.legacyEchoSet && !c.GTP.controlEchoSet {
+		controlEchoPath = "gtp.echo"
+	}
+	c.GTP.ControlEcho = normalizeGTPEchoConfig(c.GTP.ControlEcho, controlEchoPath, &c.Warnings)
 	c.GTP.Echo = c.GTP.ControlEcho
-	c.GTP.UserEcho = normalizeGTPUserEchoConfig(c.GTP.UserEcho)
+	c.GTP.UserEcho = normalizeGTPUserEchoConfig(c.GTP.UserEcho, "gtp.user_echo", &c.Warnings)
 	if c.GTP.UserEcho.Enabled && c.GTP.UserEcho.TimeoutSeconds >= c.GTP.UserEcho.IntervalSeconds {
-		fmt.Fprintf(os.Stderr, "VectorCore TWAG: warning: gtp.user_echo.timeout_seconds should be less than interval_seconds\n")
+		c.warn("gtp.user_echo.timeout_seconds should be less than interval_seconds")
 	}
 	if c.Recovery.RecoveryWindowSeconds == 0 {
 		c.Recovery.RecoveryWindowSeconds = 60
@@ -378,9 +386,17 @@ func (c *Config) ApplyDefaults() {
 	c.AAA.STa.AuthApplicationID = STaAuthApplicationID
 }
 
-func normalizeGTPEchoConfig(cfg GTPEchoConfig) GTPEchoConfig {
+func (c *Config) warn(message string) {
+	c.Warnings = append(c.Warnings, message)
+	fmt.Fprintf(os.Stderr, "VectorCore TWAG: warning: %s\n", message)
+}
+
+func normalizeGTPEchoConfig(cfg GTPEchoConfig, path string, warnings *[]string) GTPEchoConfig {
 	if cfg.IntervalSeconds == 0 {
-		cfg.IntervalSeconds = 30
+		cfg.IntervalSeconds = MinGTPEchoIntervalSeconds
+	} else if cfg.IntervalSeconds > 0 && cfg.IntervalSeconds < MinGTPEchoIntervalSeconds {
+		warnGTPEchoIntervalClamped(path, cfg.IntervalSeconds, warnings)
+		cfg.IntervalSeconds = MinGTPEchoIntervalSeconds
 	}
 	if cfg.TimeoutSeconds == 0 {
 		cfg.TimeoutSeconds = 5
@@ -391,12 +407,15 @@ func normalizeGTPEchoConfig(cfg GTPEchoConfig) GTPEchoConfig {
 	return cfg
 }
 
-func normalizeGTPUserEchoConfig(cfg GTPUserEchoConfig) GTPUserEchoConfig {
+func normalizeGTPUserEchoConfig(cfg GTPUserEchoConfig, path string, warnings *[]string) GTPUserEchoConfig {
 	if cfg.Mode == "" {
 		cfg.Mode = "kernel_netlink"
 	}
 	if cfg.IntervalSeconds == 0 {
-		cfg.IntervalSeconds = 30
+		cfg.IntervalSeconds = MinGTPEchoIntervalSeconds
+	} else if cfg.IntervalSeconds > 0 && cfg.IntervalSeconds < MinGTPEchoIntervalSeconds {
+		warnGTPEchoIntervalClamped(path, cfg.IntervalSeconds, warnings)
+		cfg.IntervalSeconds = MinGTPEchoIntervalSeconds
 	}
 	if cfg.TimeoutSeconds == 0 {
 		cfg.TimeoutSeconds = 5
@@ -405,6 +424,12 @@ func normalizeGTPUserEchoConfig(cfg GTPUserEchoConfig) GTPUserEchoConfig {
 		cfg.MaxFailures = 3
 	}
 	return cfg
+}
+
+func warnGTPEchoIntervalClamped(path string, configured int, warnings *[]string) {
+	msg := fmt.Sprintf("%s.interval_seconds configured below %d seconds; clamping configured value %d to %d to avoid sending GTP Echo too frequently", path, MinGTPEchoIntervalSeconds, configured, MinGTPEchoIntervalSeconds)
+	*warnings = append(*warnings, msg)
+	fmt.Fprintf(os.Stderr, "VectorCore TWAG: warning: %s\n", msg)
 }
 
 func (c *Config) Validate() error {
