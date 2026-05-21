@@ -7,6 +7,7 @@ import (
 	"net"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/vectorcore/twag/internal/aaa"
 	"github.com/vectorcore/twag/internal/config"
@@ -17,6 +18,9 @@ import (
 	"github.com/vectorcore/twag/internal/routing"
 	"github.com/vectorcore/twag/internal/session"
 )
+
+func testNow() time.Time  { return time.Now().UTC() }
+func zeroTime() time.Time { return time.Time{} }
 
 func TestAttachSuccessCreatesActiveSession(t *testing.T) {
 	svc, deps := newTestService(t)
@@ -133,6 +137,144 @@ func TestAccountingStopCleansUpActiveSession(t *testing.T) {
 	}
 	if _, ok := deps.sessions.Get(resp.SessionID); ok {
 		t.Fatal("accounting stop should remove active session")
+	}
+}
+
+func TestAccountingStopRetainsAuthCache(t *testing.T) {
+	svc, deps := newTestService(t)
+	resp, err := svc.AttachAuthorized(context.Background(), AttachRequest{
+		IMSI:             "001010000000001",
+		MACAddress:       "aa:bb:cc:dd:ee:01",
+		Username:         "001010000000001",
+		APN:              "internet",
+		AcctSessionID:    "acct-1",
+		NASIP:            "192.168.105.71",
+		NASIdentifier:    "ap-1",
+		CallingStationID: "aa:bb:cc:dd:ee:01",
+	}, &aaa.AuthResult{Allowed: true, IMSI: "001010000000001", APN: "internet", Reason: "accepted"})
+	if err != nil {
+		t.Fatalf("AttachAuthorized() error = %v", err)
+	}
+	if _, ok := deps.sessions.LookupValidAuthCache("aa:bb:cc:dd:ee:01", "001010000000001", "internet", zeroTime()); !ok {
+		t.Fatal("auth cache missing after access accept")
+	}
+	err = svc.HandleAccounting(context.Background(), AccountingRequest{
+		StatusType:     AccountingStop,
+		AcctSessionID:  "acct-1",
+		MACAddress:     "aa:bb:cc:dd:ee:01",
+		IMSI:           "001010000000001",
+		NASIP:          "192.168.105.71",
+		NASIdentifier:  "ap-1",
+		TerminateCause: "User-Request",
+	})
+	if err != nil {
+		t.Fatalf("HandleAccounting() error = %v", err)
+	}
+	if _, ok := deps.sessions.Get(resp.SessionID); ok {
+		t.Fatal("accounting stop should remove active session")
+	}
+	entry, ok := deps.sessions.LookupValidAuthCache("aa:bb:cc:dd:ee:01", "001010000000001", "internet", zeroTime())
+	if !ok {
+		t.Fatal("auth cache should be retained after accounting stop")
+	}
+	if entry.LastAccountingStopCause != "User-Request" {
+		t.Fatalf("last stop cause = %q", entry.LastAccountingStopCause)
+	}
+}
+
+func TestAccountingStartWithValidAuthCacheRebuildsSession(t *testing.T) {
+	svc, deps := newTestService(t)
+	_, ok := deps.sessions.UpsertAuthCache(session.AuthCacheUpdate{
+		MACAddress:                "aa:bb:cc:dd:ee:01",
+		IMSI:                      "001010000000001",
+		UserName:                  "001010000000001",
+		APN:                       "internet",
+		NASIP:                     "192.168.105.71",
+		NASIdentifier:             "ap-1",
+		CallingStationID:          "aa:bb:cc:dd:ee:01",
+		SessionTimeoutSeconds:     3600,
+		AuthStartTime:             testNow(),
+		AuthExpiresAt:             testNow().AddDate(0, 0, 1),
+		LastAccessAcceptSessionID: "old",
+	})
+	if !ok {
+		t.Fatal("auth cache insert failed")
+	}
+	err := svc.HandleAccounting(context.Background(), AccountingRequest{
+		StatusType:    AccountingStart,
+		AcctSessionID: "acct-reconnect",
+		MACAddress:    "aa:bb:cc:dd:ee:01",
+		IMSI:          "001010000000001",
+		UserName:      "001010000000001",
+		NASIP:         "192.168.105.71",
+		NASIdentifier: "ap-1",
+	})
+	if err != nil {
+		t.Fatalf("HandleAccounting() error = %v", err)
+	}
+	if deps.pgw.created != 1 {
+		t.Fatalf("pgw creates = %d, want 1", deps.pgw.created)
+	}
+	sess, ok := deps.sessions.LookupByAcctSession("acct-reconnect", "192.168.105.71", "ap-1")
+	if !ok {
+		t.Fatal("recovered session not bound to accounting session")
+	}
+	if sess.State != session.Active {
+		t.Fatalf("state = %q, want active", sess.State)
+	}
+}
+
+func TestAccountingStartWithoutAuthCacheDoesNotRebuild(t *testing.T) {
+	svc, deps := newTestService(t)
+	da := &fakeDynamicAuthorizer{}
+	svc.SetDynamicAuthorizer(da)
+	err := svc.HandleAccounting(context.Background(), AccountingRequest{
+		StatusType:    AccountingStart,
+		AcctSessionID: "acct-missing",
+		MACAddress:    "aa:bb:cc:dd:ee:01",
+		IMSI:          "001010000000001",
+		UserName:      "001010000000001",
+		NASIP:         "192.168.105.71",
+	})
+	if err != nil {
+		t.Fatalf("HandleAccounting() error = %v", err)
+	}
+	if deps.pgw.created != 0 {
+		t.Fatalf("pgw creates = %d, want 0", deps.pgw.created)
+	}
+	if da.calls != 1 {
+		t.Fatalf("dynamic authorization calls = %d, want 1", da.calls)
+	}
+}
+
+func TestAccountingStartRecoverySuppressesDuplicates(t *testing.T) {
+	svc, deps := newTestService(t)
+	_, ok := deps.sessions.UpsertAuthCache(session.AuthCacheUpdate{
+		MACAddress:            "aa:bb:cc:dd:ee:01",
+		IMSI:                  "001010000000001",
+		UserName:              "001010000000001",
+		APN:                   "internet",
+		SessionTimeoutSeconds: 3600,
+		AuthStartTime:         testNow(),
+		AuthExpiresAt:         testNow().AddDate(0, 0, 1),
+	})
+	if !ok {
+		t.Fatal("auth cache insert failed")
+	}
+	for i := 0; i < 3; i++ {
+		err := svc.HandleAccounting(context.Background(), AccountingRequest{
+			StatusType:    AccountingStart,
+			AcctSessionID: "acct-reconnect",
+			MACAddress:    "aa:bb:cc:dd:ee:01",
+			IMSI:          "001010000000001",
+			UserName:      "001010000000001",
+		})
+		if err != nil {
+			t.Fatalf("HandleAccounting() error = %v", err)
+		}
+	}
+	if deps.pgw.created != 1 {
+		t.Fatalf("pgw creates = %d, want 1", deps.pgw.created)
 	}
 }
 
@@ -648,6 +790,23 @@ func newTestService(t *testing.T) (*Service, testDeps) {
 		Subscriber: config.SubscriberConfig{
 			DefaultAPN:   "internet",
 			DefaultRealm: "ims.example",
+		},
+		Radius: config.RadiusConfig{
+			AuthCache:    config.RadiusAuthCacheConfig{Enabled: true, DefaultTTLSeconds: 3600, MaxTTLSeconds: 86400},
+			AccessAccept: config.RadiusAccessAcceptConfig{SessionTimeoutSeconds: 3600},
+			Accounting: config.RadiusAccountingConfig{
+				ClearSessionOnStop:        true,
+				StartWithoutSessionAction: "recover_if_auth_valid",
+				StartWithoutAuthAction:    "disconnect",
+			},
+		},
+		Recovery: config.RecoveryConfig{
+			Enabled: true,
+			AccountingStartRecovery: config.AccountingStartRecoveryConfig{
+				Enabled:              true,
+				CooldownSeconds:      10,
+				MaxAttemptsPerMinute: 3,
+			},
 		},
 		IPAM: config.IPAMConfig{
 			Pool:    "10.200.0.0/24",

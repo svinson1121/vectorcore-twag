@@ -46,6 +46,12 @@ func (m *Manager) SetRecoveryAttachHandler(handler RecoveryAttachHandler) {
 	}
 }
 
+func (m *Manager) SetAuthCacheRecoveryHandler(handler AuthCacheRecoveryHandler) {
+	if m.dhcp != nil {
+		m.dhcp.SetAuthCacheRecoveryHandler(handler)
+	}
+}
+
 func (m *Manager) Start(ctx context.Context) error {
 	if m.cfg == nil {
 		return nil

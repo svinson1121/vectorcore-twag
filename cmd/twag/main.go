@@ -154,6 +154,11 @@ func run(cfg *config.Config, log *slog.Logger) error {
 			)
 		}
 	})
+	accessSide.SetAuthCacheRecoveryHandler(func(ctx context.Context, mac string) {
+		recoverCtx, cancel := context.WithTimeout(ctx, 45*time.Second)
+		defer cancel()
+		lifecycleSvc.HandleDHCPAuthCacheRecovery(recoverCtx, mac)
+	})
 	lifecycleSvc.SetAccessSessionBinder(accessSide)
 	radiusSrv := radiusserver.New(cfg.Radius, cfg.Subscriber, lifecycleSvc, log)
 

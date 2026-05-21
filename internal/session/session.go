@@ -81,6 +81,50 @@ type Session struct {
 	Reason             string    `json:"reason,omitempty"`
 }
 
+type AuthCacheEntry struct {
+	MACAddress                string    `json:"mac"`
+	IMSI                      string    `json:"imsi"`
+	UserName                  string    `json:"user_name,omitempty"`
+	APN                       string    `json:"apn,omitempty"`
+	MSISDN                    string    `json:"msisdn,omitempty"`
+	NASIP                     string    `json:"nas_ip,omitempty"`
+	NASIdentifier             string    `json:"nas_identifier,omitempty"`
+	CalledStationID           string    `json:"called_station_id,omitempty"`
+	CallingStationID          string    `json:"calling_station_id,omitempty"`
+	SSID                      string    `json:"ssid,omitempty"`
+	BSSID                     string    `json:"bssid,omitempty"`
+	AcctSessionID             string    `json:"acct_session_id,omitempty"`
+	SessionTimeoutSeconds     int       `json:"session_timeout_seconds"`
+	AuthStartTime             time.Time `json:"auth_start_time"`
+	AuthExpiresAt             time.Time `json:"auth_expires_at"`
+	LastSeenTime              time.Time `json:"last_seen_time"`
+	LastAccessAcceptSessionID string    `json:"last_access_accept_session_id,omitempty"`
+	LastAccountingStopAt      time.Time `json:"last_accounting_stop_at,omitempty"`
+	LastAccountingStopCause   string    `json:"last_accounting_stop_cause,omitempty"`
+}
+
+type AuthCacheUpdate struct {
+	MACAddress                string
+	IMSI                      string
+	UserName                  string
+	APN                       string
+	MSISDN                    string
+	NASIP                     string
+	NASIdentifier             string
+	CalledStationID           string
+	CallingStationID          string
+	SSID                      string
+	BSSID                     string
+	AcctSessionID             string
+	SessionTimeoutSeconds     int
+	AuthStartTime             time.Time
+	AuthExpiresAt             time.Time
+	LastSeenTime              time.Time
+	LastAccessAcceptSessionID string
+	LastAccountingStopAt      time.Time
+	LastAccountingStopCause   string
+}
+
 type RecoveryTombstone struct {
 	MAC              net.HardwareAddr `json:"mac,omitempty"`
 	IMSI             string           `json:"imsi,omitempty"`

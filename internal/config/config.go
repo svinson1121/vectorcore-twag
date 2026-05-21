@@ -56,6 +56,7 @@ type AccessConfig struct {
 type DHCPConfig struct {
 	Enabled                  bool     `yaml:"enabled"`
 	RequireAuthorizedSession bool     `yaml:"require_authorized_session"`
+	RecoverFromAuthCache     bool     `yaml:"recover_from_auth_cache"`
 	LeaseTimeSeconds         uint32   `yaml:"lease_time_seconds"`
 	RenewalTimeSeconds       uint32   `yaml:"renewal_time_seconds"`
 	RebindingTimeSeconds     uint32   `yaml:"rebinding_time_seconds"`
@@ -88,9 +89,16 @@ type RadiusConfig struct {
 	Secret               string                     `yaml:"secret"`
 	VLANID               int                        `yaml:"vlan_id"`
 	AllowedSourceSubnets []string                   `yaml:"allowed_source_subnets"`
+	AuthCache            RadiusAuthCacheConfig      `yaml:"auth_cache"`
 	AccessAccept         RadiusAccessAcceptConfig   `yaml:"access_accept"`
 	Accounting           RadiusAccountingConfig     `yaml:"accounting"`
 	DynamicAuthorization DynamicAuthorizationConfig `yaml:"dynamic_authorization"`
+}
+
+type RadiusAuthCacheConfig struct {
+	Enabled           bool `yaml:"enabled"`
+	DefaultTTLSeconds int  `yaml:"default_ttl_seconds"`
+	MaxTTLSeconds     int  `yaml:"max_ttl_seconds"`
 }
 
 type RadiusAccessAcceptConfig struct {
@@ -100,12 +108,15 @@ type RadiusAccessAcceptConfig struct {
 }
 
 type RadiusAccountingConfig struct {
-	Enabled               bool   `yaml:"enabled"`
-	ListenAddr            string `yaml:"listen_addr"`
-	Secret                string `yaml:"secret"`
-	ClearSessionOnStop    bool   `yaml:"clear_session_on_stop"`
-	InterimUpdateLiveness bool   `yaml:"interim_update_liveness"`
-	AccountingOffAction   string `yaml:"accounting_off_action"`
+	Enabled                   bool   `yaml:"enabled"`
+	ListenAddr                string `yaml:"listen_addr"`
+	Secret                    string `yaml:"secret"`
+	ClearSessionOnStop        bool   `yaml:"clear_session_on_stop"`
+	ClearAuthCacheOnStop      bool   `yaml:"clear_auth_cache_on_stop"`
+	InterimUpdateLiveness     bool   `yaml:"interim_update_liveness"`
+	AccountingOffAction       string `yaml:"accounting_off_action"`
+	StartWithoutSessionAction string `yaml:"start_without_session_action"`
+	StartWithoutAuthAction    string `yaml:"start_without_auth_action"`
 }
 
 type DynamicAuthorizationConfig struct {
@@ -196,15 +207,22 @@ type GTPUserEchoConfig struct {
 }
 
 type RecoveryConfig struct {
-	Enabled                  bool                   `yaml:"enabled"`
-	ReasonGTPUError          bool                   `yaml:"reason_gtpu_error_indication"`
-	RecoveryWindowSeconds    int                    `yaml:"recovery_window_seconds"`
-	StaleClientGraceSeconds  int                    `yaml:"stale_client_grace_seconds"`
-	CleanupOnDuplicateAttach bool                   `yaml:"cleanup_on_duplicate_attach"`
-	AllowSameMACReattach     bool                   `yaml:"allow_same_mac_reattach"`
-	RejectOldDHCPIP          bool                   `yaml:"reject_old_dhcp_ip"`
-	DHCPStaleRequestAction   string                 `yaml:"dhcp_stale_request_action"`
-	RadiusDisconnect         RadiusDisconnectConfig `yaml:"radius_disconnect"`
+	Enabled                  bool                          `yaml:"enabled"`
+	ReasonGTPUError          bool                          `yaml:"reason_gtpu_error_indication"`
+	RecoveryWindowSeconds    int                           `yaml:"recovery_window_seconds"`
+	StaleClientGraceSeconds  int                           `yaml:"stale_client_grace_seconds"`
+	CleanupOnDuplicateAttach bool                          `yaml:"cleanup_on_duplicate_attach"`
+	AllowSameMACReattach     bool                          `yaml:"allow_same_mac_reattach"`
+	RejectOldDHCPIP          bool                          `yaml:"reject_old_dhcp_ip"`
+	DHCPStaleRequestAction   string                        `yaml:"dhcp_stale_request_action"`
+	RadiusDisconnect         RadiusDisconnectConfig        `yaml:"radius_disconnect"`
+	AccountingStartRecovery  AccountingStartRecoveryConfig `yaml:"accounting_start_recovery"`
+}
+
+type AccountingStartRecoveryConfig struct {
+	Enabled              bool `yaml:"enabled"`
+	CooldownSeconds      int  `yaml:"cooldown_seconds"`
+	MaxAttemptsPerMinute int  `yaml:"max_attempts_per_minute"`
 }
 
 type RadiusDisconnectConfig struct {
@@ -276,6 +294,7 @@ func Default() *Config {
 			DHCP: DHCPConfig{
 				Mode:                     "proxy",
 				RequireAuthorizedSession: true,
+				RecoverFromAuthCache:     true,
 				LeaseTimeSeconds:         600,
 				RenewalTimeSeconds:       300,
 				RebindingTimeSeconds:     525,
@@ -289,8 +308,9 @@ func Default() *Config {
 		},
 		Radius: RadiusConfig{
 			Enabled:              true,
+			AuthCache:            RadiusAuthCacheConfig{Enabled: true, DefaultTTLSeconds: 3600, MaxTTLSeconds: 86400},
 			AccessAccept:         RadiusAccessAcceptConfig{SessionTimeoutSeconds: 3600, TerminationAction: "radius_request"},
-			Accounting:           RadiusAccountingConfig{ListenAddr: "0.0.0.0:1813", ClearSessionOnStop: true, InterimUpdateLiveness: true, AccountingOffAction: "mark_at_risk"},
+			Accounting:           RadiusAccountingConfig{ListenAddr: "0.0.0.0:1813", ClearSessionOnStop: true, InterimUpdateLiveness: true, AccountingOffAction: "mark_at_risk", StartWithoutSessionAction: "recover_if_auth_valid", StartWithoutAuthAction: "disconnect"},
 			DynamicAuthorization: DynamicAuthorizationConfig{DefaultPort: 3799, PreferDiscoveredNAS: true},
 		},
 		AAA: AAAConfig{
@@ -300,7 +320,7 @@ func Default() *Config {
 			},
 		},
 		GTP:       GTPConfig{ChargingCharacteristics: "0800", KernelInterface: "gtp0", ControlEcho: GTPEchoConfig{Enabled: true, IntervalSeconds: MinGTPEchoIntervalSeconds, TimeoutSeconds: 5, MaxFailures: 3, StartupProbe: true}, UserEcho: GTPUserEchoConfig{Mode: "kernel_netlink", IntervalSeconds: MinGTPEchoIntervalSeconds, TimeoutSeconds: 5, MaxFailures: 3}},
-		Recovery:  RecoveryConfig{Enabled: true, ReasonGTPUError: true, RecoveryWindowSeconds: 60, StaleClientGraceSeconds: 10, CleanupOnDuplicateAttach: true, AllowSameMACReattach: true, RejectOldDHCPIP: true, DHCPStaleRequestAction: "nak", RadiusDisconnect: RadiusDisconnectConfig{NASPort: 3799, TimeoutSeconds: 3, Retries: 2, RequestType: "disconnect", AccountingStopTimeoutSeconds: 10, FallbackToRecoveryTombstone: true}},
+		Recovery:  RecoveryConfig{Enabled: true, ReasonGTPUError: true, RecoveryWindowSeconds: 60, StaleClientGraceSeconds: 10, CleanupOnDuplicateAttach: true, AllowSameMACReattach: true, RejectOldDHCPIP: true, DHCPStaleRequestAction: "nak", RadiusDisconnect: RadiusDisconnectConfig{NASPort: 3799, TimeoutSeconds: 3, Retries: 2, RequestType: "disconnect", AccountingStopTimeoutSeconds: 10, FallbackToRecoveryTombstone: true}, AccountingStartRecovery: AccountingStartRecoveryConfig{Enabled: true, CooldownSeconds: 10, MaxAttemptsPerMinute: 3}},
 		Lifecycle: LifecycleConfig{DuplicateAttachPolicy: "reuse_existing", DuplicateAttachCleanupTimeoutSeconds: 5, SuppressDuplicateCreateSession: true, PerSubscriberLockTimeoutSeconds: 10, PostActivationValidation: PostActivationValidationConfig{Enabled: true, FailAction: "trigger_recovery"}},
 		Routing:   RoutingConfig{InstallRoutes: true},
 	}
@@ -320,6 +340,7 @@ func (c *Config) ApplyDefaults() {
 	if c.Access.DHCP.Mode == "" {
 		c.Access.DHCP.Mode = "proxy"
 	}
+	c.Access.DHCP.RecoverFromAuthCache = true
 	c.Access.DHCP.Interface = c.Access.Interface
 	c.Access.DHCP.Netmask = c.Access.Netmask
 	c.Access.DHCP.Router = c.Access.GatewayIP
@@ -351,6 +372,19 @@ func (c *Config) ApplyDefaults() {
 	if c.Radius.AccessAccept.SessionTimeoutSeconds == 0 {
 		c.Radius.AccessAccept.SessionTimeoutSeconds = 3600
 	}
+	c.Radius.AuthCache.Enabled = true
+	if c.Radius.AuthCache.DefaultTTLSeconds == 0 {
+		c.Radius.AuthCache.DefaultTTLSeconds = c.Radius.AccessAccept.SessionTimeoutSeconds
+	}
+	if c.Radius.AuthCache.DefaultTTLSeconds == 0 {
+		c.Radius.AuthCache.DefaultTTLSeconds = 3600
+	}
+	if c.Radius.AuthCache.MaxTTLSeconds == 0 {
+		c.Radius.AuthCache.MaxTTLSeconds = 86400
+	}
+	if c.Radius.AuthCache.DefaultTTLSeconds > c.Radius.AuthCache.MaxTTLSeconds {
+		c.Radius.AuthCache.DefaultTTLSeconds = c.Radius.AuthCache.MaxTTLSeconds
+	}
 	if c.Radius.AccessAccept.TerminationAction == "" {
 		c.Radius.AccessAccept.TerminationAction = "radius_request"
 	}
@@ -364,6 +398,12 @@ func (c *Config) ApplyDefaults() {
 	c.Radius.Accounting.InterimUpdateLiveness = true
 	if c.Radius.Accounting.AccountingOffAction == "" {
 		c.Radius.Accounting.AccountingOffAction = "mark_at_risk"
+	}
+	if c.Radius.Accounting.StartWithoutSessionAction == "" {
+		c.Radius.Accounting.StartWithoutSessionAction = "recover_if_auth_valid"
+	}
+	if c.Radius.Accounting.StartWithoutAuthAction == "" {
+		c.Radius.Accounting.StartWithoutAuthAction = "disconnect"
 	}
 	if c.Radius.DynamicAuthorization.DefaultPort == 0 {
 		c.Radius.DynamicAuthorization.DefaultPort = 3799
@@ -423,6 +463,13 @@ func (c *Config) ApplyDefaults() {
 		c.Recovery.RadiusDisconnect.AccountingStopTimeoutSeconds = 10
 	}
 	c.Recovery.RadiusDisconnect.FallbackToRecoveryTombstone = true
+	c.Recovery.AccountingStartRecovery.Enabled = true
+	if c.Recovery.AccountingStartRecovery.CooldownSeconds == 0 {
+		c.Recovery.AccountingStartRecovery.CooldownSeconds = 10
+	}
+	if c.Recovery.AccountingStartRecovery.MaxAttemptsPerMinute == 0 {
+		c.Recovery.AccountingStartRecovery.MaxAttemptsPerMinute = 3
+	}
 	if c.Lifecycle.DuplicateAttachPolicy == "" {
 		c.Lifecycle.DuplicateAttachPolicy = "reuse_existing"
 	}
@@ -574,6 +621,16 @@ func (c *Config) Validate() error {
 	default:
 		errs = append(errs, "radius.accounting.accounting_off_action must be mark_at_risk, clear_sessions, or ignore")
 	}
+	switch c.Radius.Accounting.StartWithoutSessionAction {
+	case "recover_if_auth_valid", "disconnect", "ignore":
+	default:
+		errs = append(errs, "radius.accounting.start_without_session_action must be recover_if_auth_valid, disconnect, or ignore")
+	}
+	switch c.Radius.Accounting.StartWithoutAuthAction {
+	case "disconnect", "ignore", "log_only":
+	default:
+		errs = append(errs, "radius.accounting.start_without_auth_action must be disconnect, ignore, or log_only")
+	}
 	if c.Radius.DynamicAuthorization.DefaultPort < 0 || c.Radius.DynamicAuthorization.DefaultPort > 65535 {
 		errs = append(errs, "radius.dynamic_authorization.default_port must be between 0 and 65535")
 	}
@@ -639,6 +696,12 @@ func (c *Config) Validate() error {
 	}
 	if c.Recovery.RadiusDisconnect.RequestType != "disconnect" && c.Recovery.RadiusDisconnect.RequestType != "coa" {
 		errs = append(errs, "session_recovery.radius_disconnect.request_type must be disconnect or coa")
+	}
+	if c.Recovery.AccountingStartRecovery.CooldownSeconds <= 0 {
+		errs = append(errs, "session_recovery.accounting_start_recovery.cooldown_seconds must be greater than 0")
+	}
+	if c.Recovery.AccountingStartRecovery.MaxAttemptsPerMinute <= 0 {
+		errs = append(errs, "session_recovery.accounting_start_recovery.max_attempts_per_minute must be greater than 0")
 	}
 	if c.Lifecycle.DuplicateAttachPolicy != "reuse_existing" && c.Lifecycle.DuplicateAttachPolicy != "replace_existing" {
 		errs = append(errs, "session_lifecycle.duplicate_attach_policy must be reuse_existing or replace_existing")

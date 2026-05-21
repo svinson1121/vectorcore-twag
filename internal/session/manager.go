@@ -44,6 +44,11 @@ type Manager struct {
 	byIP   map[string]*Session
 	byTEID map[uint32]*Session
 
+	authByKey     map[string]*AuthCacheEntry
+	authByMAC     map[string]*AuthCacheEntry
+	authByIMSI    map[string]*AuthCacheEntry
+	authByAcctNAS map[string]*AuthCacheEntry
+
 	recoveryByMAC     map[string]*RecoveryTombstone
 	recoveryByIMSI    map[string]*RecoveryTombstone
 	recoveryByIP      map[string]*RecoveryTombstone
@@ -60,6 +65,10 @@ func NewManager(log *slog.Logger) *Manager {
 		byMAC:             make(map[string]*Session),
 		byIP:              make(map[string]*Session),
 		byTEID:            make(map[uint32]*Session),
+		authByKey:         make(map[string]*AuthCacheEntry),
+		authByMAC:         make(map[string]*AuthCacheEntry),
+		authByIMSI:        make(map[string]*AuthCacheEntry),
+		authByAcctNAS:     make(map[string]*AuthCacheEntry),
 		recoveryByMAC:     make(map[string]*RecoveryTombstone),
 		recoveryByIMSI:    make(map[string]*RecoveryTombstone),
 		recoveryByIP:      make(map[string]*RecoveryTombstone),
@@ -440,6 +449,149 @@ func (m *Manager) ApplyAccounting(id string, update AccountingUpdate) (*Session,
 	})
 }
 
+func (m *Manager) UpsertAuthCache(update AuthCacheUpdate) (*AuthCacheEntry, bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	mac := normalizeMAC(update.MACAddress)
+	imsi := strings.TrimSpace(update.IMSI)
+	apn := strings.TrimSpace(update.APN)
+	if mac == "" || imsi == "" {
+		return nil, false
+	}
+	key := authCacheKey(mac, imsi, apn)
+	now := time.Now().UTC()
+	entry := m.authByKey[key]
+	if entry == nil {
+		entry = &AuthCacheEntry{
+			MACAddress:    mac,
+			IMSI:          imsi,
+			APN:           apn,
+			AuthStartTime: now,
+		}
+	} else {
+		m.unindexAuthCacheLocked(entry)
+	}
+	if update.UserName != "" {
+		entry.UserName = update.UserName
+	}
+	if update.MSISDN != "" {
+		entry.MSISDN = update.MSISDN
+	}
+	if update.NASIP != "" {
+		entry.NASIP = update.NASIP
+	}
+	if update.NASIdentifier != "" {
+		entry.NASIdentifier = update.NASIdentifier
+	}
+	if update.CalledStationID != "" {
+		entry.CalledStationID = update.CalledStationID
+	}
+	if update.CallingStationID != "" {
+		entry.CallingStationID = update.CallingStationID
+	}
+	if update.SSID != "" {
+		entry.SSID = update.SSID
+	}
+	if update.BSSID != "" {
+		entry.BSSID = update.BSSID
+	}
+	if update.AcctSessionID != "" {
+		entry.AcctSessionID = update.AcctSessionID
+	}
+	if update.SessionTimeoutSeconds > 0 {
+		entry.SessionTimeoutSeconds = update.SessionTimeoutSeconds
+	}
+	if !update.AuthStartTime.IsZero() {
+		entry.AuthStartTime = update.AuthStartTime
+	}
+	if !update.AuthExpiresAt.IsZero() {
+		entry.AuthExpiresAt = update.AuthExpiresAt
+	}
+	if !update.LastSeenTime.IsZero() {
+		entry.LastSeenTime = update.LastSeenTime
+	} else {
+		entry.LastSeenTime = now
+	}
+	if update.LastAccessAcceptSessionID != "" {
+		entry.LastAccessAcceptSessionID = update.LastAccessAcceptSessionID
+	}
+	if !update.LastAccountingStopAt.IsZero() {
+		entry.LastAccountingStopAt = update.LastAccountingStopAt
+	}
+	if update.LastAccountingStopCause != "" {
+		entry.LastAccountingStopCause = update.LastAccountingStopCause
+	}
+	m.indexAuthCacheLocked(entry)
+	return cloneAuthCache(entry), true
+}
+
+func (m *Manager) LookupValidAuthCache(mac, imsi, apn string, now time.Time) (*AuthCacheEntry, bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if now.IsZero() {
+		now = time.Now().UTC()
+	}
+	var entry *AuthCacheEntry
+	if mac != "" && imsi != "" {
+		entry = m.authByKey[authCacheKey(normalizeMAC(mac), strings.TrimSpace(imsi), strings.TrimSpace(apn))]
+		if entry == nil && apn != "" {
+			entry = m.authByKey[authCacheKey(normalizeMAC(mac), strings.TrimSpace(imsi), "")]
+		}
+	}
+	if entry == nil && mac != "" {
+		entry = m.authByMAC[normalizeMAC(mac)]
+	}
+	if entry == nil && imsi != "" {
+		entry = m.authByIMSI[strings.TrimSpace(imsi)]
+	}
+	if entry == nil || m.authCacheExpiredLocked(entry, now) {
+		return nil, false
+	}
+	if apn != "" && entry.APN != "" && !sameAPN(entry.APN, apn) {
+		return nil, false
+	}
+	return cloneAuthCache(entry), true
+}
+
+func (m *Manager) LookupValidAuthCacheByAcct(acctSessionID, nasIP, nasIdentifier string, now time.Time) (*AuthCacheEntry, bool) {
+	if acctSessionID == "" {
+		return nil, false
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if now.IsZero() {
+		now = time.Now().UTC()
+	}
+	keys := []string{
+		authAcctKey(acctSessionID, nasIP, nasIdentifier),
+		authAcctKey(acctSessionID, nasIP, ""),
+		authAcctKey(acctSessionID, "", nasIdentifier),
+		authAcctKey(acctSessionID, "", ""),
+	}
+	for _, key := range keys {
+		entry := m.authByAcctNAS[key]
+		if entry == nil || m.authCacheExpiredLocked(entry, now) {
+			continue
+		}
+		return cloneAuthCache(entry), true
+	}
+	return nil, false
+}
+
+func (m *Manager) DeleteAuthCache(mac, imsi, apn string) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	entry := m.authByKey[authCacheKey(normalizeMAC(mac), strings.TrimSpace(imsi), strings.TrimSpace(apn))]
+	if entry == nil && mac != "" {
+		entry = m.authByMAC[normalizeMAC(mac)]
+	}
+	if entry == nil {
+		return false
+	}
+	m.unindexAuthCacheLocked(entry)
+	return true
+}
+
 func (m *Manager) AddRecoveryTombstone(sess *Session, reason string, ttl time.Duration) (*RecoveryTombstone, bool) {
 	if sess == nil || ttl <= 0 {
 		return nil, false
@@ -772,6 +924,59 @@ func (m *Manager) unindexLocked(s *Session) {
 	}
 }
 
+func (m *Manager) indexAuthCacheLocked(entry *AuthCacheEntry) {
+	if entry == nil {
+		return
+	}
+	m.authByKey[authCacheKey(entry.MACAddress, entry.IMSI, entry.APN)] = entry
+	if entry.MACAddress != "" {
+		m.authByMAC[entry.MACAddress] = entry
+	}
+	if entry.IMSI != "" {
+		m.authByIMSI[entry.IMSI] = entry
+	}
+	if entry.AcctSessionID != "" {
+		m.authByAcctNAS[authAcctKey(entry.AcctSessionID, entry.NASIP, entry.NASIdentifier)] = entry
+		m.authByAcctNAS[authAcctKey(entry.AcctSessionID, entry.NASIP, "")] = entry
+		m.authByAcctNAS[authAcctKey(entry.AcctSessionID, "", entry.NASIdentifier)] = entry
+		m.authByAcctNAS[authAcctKey(entry.AcctSessionID, "", "")] = entry
+	}
+}
+
+func (m *Manager) unindexAuthCacheLocked(entry *AuthCacheEntry) {
+	if entry == nil {
+		return
+	}
+	delete(m.authByKey, authCacheKey(entry.MACAddress, entry.IMSI, entry.APN))
+	delete(m.authByMAC, entry.MACAddress)
+	delete(m.authByIMSI, entry.IMSI)
+	if entry.AcctSessionID != "" {
+		delete(m.authByAcctNAS, authAcctKey(entry.AcctSessionID, entry.NASIP, entry.NASIdentifier))
+		delete(m.authByAcctNAS, authAcctKey(entry.AcctSessionID, entry.NASIP, ""))
+		delete(m.authByAcctNAS, authAcctKey(entry.AcctSessionID, "", entry.NASIdentifier))
+		delete(m.authByAcctNAS, authAcctKey(entry.AcctSessionID, "", ""))
+	}
+}
+
+func (m *Manager) authCacheExpiredLocked(entry *AuthCacheEntry, now time.Time) bool {
+	if entry == nil {
+		return true
+	}
+	if !entry.AuthExpiresAt.IsZero() && !now.Before(entry.AuthExpiresAt) {
+		m.unindexAuthCacheLocked(entry)
+		return true
+	}
+	return false
+}
+
+func authCacheKey(mac, imsi, apn string) string {
+	return normalizeMAC(mac) + "|" + strings.TrimSpace(imsi) + "|" + strings.ToLower(strings.TrimSpace(apn))
+}
+
+func authAcctKey(acctSessionID, nasIP, nasIdentifier string) string {
+	return strings.TrimSpace(acctSessionID) + "|" + strings.TrimSpace(nasIP) + "|" + strings.TrimSpace(nasIdentifier)
+}
+
 func clone(s *Session) *Session {
 	if s == nil {
 		return nil
@@ -782,6 +987,14 @@ func clone(s *Session) *Session {
 	cp.PGWControlIP = cloneIP(s.PGWControlIP)
 	cp.PGWUserIP = cloneIP(s.PGWUserIP)
 	cp.RadiusClass = append([]byte(nil), s.RadiusClass...)
+	return &cp
+}
+
+func cloneAuthCache(entry *AuthCacheEntry) *AuthCacheEntry {
+	if entry == nil {
+		return nil
+	}
+	cp := *entry
 	return &cp
 }
 

@@ -1,6 +1,7 @@
 package accessside
 
 import (
+	"context"
 	"encoding/binary"
 	"log/slog"
 	"net"
@@ -107,6 +108,28 @@ func TestDHCPDiscoverDuringRecoveryDoesNotOffer(t *testing.T) {
 	reply := srv.HandleFrame(testDHCPClientFrame(t, dhcpDiscover, 0x1006, "f0:5c:77:e8:72:9e", nil))
 	if len(reply) != 0 {
 		t.Fatalf("recovery discover produced %d-byte reply", len(reply))
+	}
+}
+
+func TestDHCPWithAuthCacheTriggersRecoveryButDoesNotOffer(t *testing.T) {
+	mgr := session.NewManager(slog.New(slog.DiscardHandler))
+	srv := testDHCPServer(mgr)
+	srv.cfg.RecoverFromAuthCache = true
+	triggered := make(chan string, 1)
+	srv.SetAuthCacheRecoveryHandler(func(_ context.Context, mac string) {
+		triggered <- mac
+	})
+	reply := srv.HandleFrame(testDHCPClientFrame(t, dhcpDiscover, 0x1007, "f0:5c:77:e8:72:9e", nil))
+	if len(reply) != 0 {
+		t.Fatalf("auth-cache recovery discover produced %d-byte reply", len(reply))
+	}
+	select {
+	case mac := <-triggered:
+		if mac != "f0:5c:77:e8:72:9e" {
+			t.Fatalf("triggered mac = %q", mac)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("expected auth-cache recovery trigger")
 	}
 }
 

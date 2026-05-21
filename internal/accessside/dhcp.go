@@ -44,11 +44,13 @@ type DHCPServer struct {
 
 	ctx              context.Context
 	recoveryHandler  RecoveryAttachHandler
+	authCacheHandler AuthCacheRecoveryHandler
 	recoveryMu       sync.Mutex
 	recoveryAttempts map[string]time.Time
 }
 
 type RecoveryAttachHandler func(context.Context, *session.RecoveryTombstone)
+type AuthCacheRecoveryHandler func(context.Context, string)
 
 type Lease struct {
 	SessionID    string
@@ -63,6 +65,10 @@ func NewDHCPServer(cfg config.DHCPConfig, sessions *session.Manager, log *slog.L
 
 func (s *DHCPServer) SetRecoveryAttachHandler(handler RecoveryAttachHandler) {
 	s.recoveryHandler = handler
+}
+
+func (s *DHCPServer) SetAuthCacheRecoveryHandler(handler AuthCacheRecoveryHandler) {
+	s.authCacheHandler = handler
 }
 
 func (s *DHCPServer) Start(ctx context.Context) error {
@@ -131,6 +137,7 @@ func (s *DHCPServer) HandleFrame(frame []byte) []byte {
 				s.triggerRecoveryAttach(tombstone)
 				return nil
 			}
+			s.triggerAuthCacheRecovery(p.ClientMAC)
 			s.log.Info("DHCP ignored unauthorized client", "mac", p.ClientMAC.String())
 			return nil
 		}
@@ -160,6 +167,7 @@ func (s *DHCPServer) HandleFrame(frame []byte) []byte {
 				}
 				return nil
 			}
+			s.triggerAuthCacheRecovery(p.ClientMAC)
 			s.log.Info("DHCP ignored unauthorized client", "mac", p.ClientMAC.String())
 			return nil
 		}
@@ -179,6 +187,26 @@ func (s *DHCPServer) HandleFrame(frame []byte) []byte {
 	default:
 		return nil
 	}
+}
+
+func (s *DHCPServer) triggerAuthCacheRecovery(mac net.HardwareAddr) {
+	if !s.cfg.RecoverFromAuthCache || s.authCacheHandler == nil || mac == nil {
+		return
+	}
+	key := "auth-cache|" + mac.String()
+	now := time.Now()
+	s.recoveryMu.Lock()
+	if last := s.recoveryAttempts[key]; !last.IsZero() && now.Sub(last) < 2*time.Second {
+		s.recoveryMu.Unlock()
+		return
+	}
+	s.recoveryAttempts[key] = now
+	s.recoveryMu.Unlock()
+	ctx := s.ctx
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	go s.authCacheHandler(ctx, mac.String())
 }
 
 func (s *DHCPServer) triggerRecoveryAttach(tombstone *session.RecoveryTombstone) {

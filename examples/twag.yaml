@@ -16,6 +16,7 @@ access:
 
   dhcp:
     enabled: true
+    recover_from_auth_cache: true
     lease_time_seconds: 600
     renewal_time_seconds: 300
     rebinding_time_seconds: 525
@@ -33,6 +34,10 @@ radius:
   vlan_id: 10
   allowed_source_subnets:
     - 192.168.105.0/24
+  auth_cache:
+    enabled: true
+    default_ttl_seconds: 3600
+    max_ttl_seconds: 86400
   access_accept:
     session_timeout_seconds: 3600
     termination_action: radius_request
@@ -42,8 +47,11 @@ radius:
     listen_addr: 0.0.0.0:1813
     secret: testing123
     clear_session_on_stop: true
+    clear_auth_cache_on_stop: false
     interim_update_liveness: true
     accounting_off_action: mark_at_risk
+    start_without_session_action: recover_if_auth_valid
+    start_without_auth_action: disconnect
   dynamic_authorization:
     default_port: 3799
     secret: testing123
@@ -94,6 +102,10 @@ session_recovery:
   allow_same_mac_reattach: true
   reject_old_dhcp_ip: true
   dhcp_stale_request_action: nak
+  accounting_start_recovery:
+    enabled: true
+    cooldown_seconds: 10
+    max_attempts_per_minute: 3
   radius_disconnect:
     enabled: true
     nas_port: 3799

@@ -147,6 +147,14 @@ type Service struct {
 	log               *slog.Logger
 	locks             sync.Map
 	counters          lifecycleCounters
+	recoveryMu        sync.Mutex
+	recoveryByKey     map[string]*authCacheRecoveryState
+}
+
+type authCacheRecoveryState struct {
+	state    string
+	lastAt   time.Time
+	attempts []time.Time
 }
 
 type lifecycleCounters struct {
@@ -170,13 +178,14 @@ type DynamicAuthorizer interface {
 
 func New(cfg *config.Config, aaaProvider aaa.Provider, sessions *session.Manager, ipam ipam.IPAM, pgwClient pgw.Client, routingMgr *routing.Manager, log *slog.Logger) *Service {
 	return &Service{
-		cfg:      cfg,
-		aaa:      aaaProvider,
-		sessions: sessions,
-		ipam:     ipam,
-		pgw:      pgwClient,
-		routing:  routingMgr,
-		log:      log,
+		cfg:           cfg,
+		aaa:           aaaProvider,
+		sessions:      sessions,
+		ipam:          ipam,
+		pgw:           pgwClient,
+		routing:       routingMgr,
+		log:           log,
+		recoveryByKey: make(map[string]*authCacheRecoveryState),
 	}
 }
 
@@ -302,6 +311,13 @@ func (s *Service) Attach(ctx context.Context, req AttachRequest) (*AttachRespons
 	if err == nil && recovering {
 		s.completeRecovery(sess, resp, recovery)
 	}
+	if err == nil && resp != nil {
+		cacheReq := req
+		cacheReq.IMSI = coalesceString(auth.IMSI, req.IMSI)
+		cacheReq.MSISDN = coalesceString(auth.MSISDN, req.MSISDN)
+		cacheReq.APN = coalesceString(auth.APN, req.APN)
+		s.updateAuthCacheFromAccessAccept(resp.SessionID, cacheReq)
+	}
 	return resp, err
 }
 
@@ -382,6 +398,13 @@ func (s *Service) AttachAuthorized(ctx context.Context, req AttachRequest, auth 
 	resp, err := s.activateAuthorizedSession(ctx, sess, auth)
 	if err == nil && recovering {
 		s.completeRecovery(sess, resp, recovery)
+	}
+	if err == nil && resp != nil {
+		cacheReq := req
+		cacheReq.IMSI = coalesceString(auth.IMSI, req.IMSI)
+		cacheReq.MSISDN = coalesceString(auth.MSISDN, req.MSISDN)
+		cacheReq.APN = coalesceString(auth.APN, req.APN)
+		s.updateAuthCacheFromAccessAccept(resp.SessionID, cacheReq)
 	}
 	return resp, err
 }
@@ -484,6 +507,58 @@ func (s *Service) ExchangeEAP(ctx context.Context, req EAPRequest) (*EAPResponse
 		EAPPayload:   res.EAPPayload,
 		MSK:          append([]byte(nil), res.MSK...),
 	}, nil
+}
+
+func (s *Service) updateAuthCacheFromAccessAccept(sessionID string, req AttachRequest) {
+	if !s.cfg.Radius.AuthCache.Enabled {
+		return
+	}
+	imsi := strings.TrimSpace(req.IMSI)
+	mac := normalizeMAC(req.MACAddress)
+	if imsi == "" || mac == "" {
+		return
+	}
+	now := time.Now().UTC()
+	ttlSeconds := s.cfg.Radius.AuthCache.DefaultTTLSeconds
+	if s.cfg.Radius.AccessAccept.SessionTimeoutSeconds > 0 {
+		ttlSeconds = s.cfg.Radius.AccessAccept.SessionTimeoutSeconds
+	}
+	if max := s.cfg.Radius.AuthCache.MaxTTLSeconds; max > 0 && ttlSeconds > max {
+		ttlSeconds = max
+	}
+	if ttlSeconds <= 0 {
+		ttlSeconds = 3600
+	}
+	bssid, ssid := splitCalledStation(req.CalledStationID)
+	entry, ok := s.sessions.UpsertAuthCache(session.AuthCacheUpdate{
+		MACAddress:                mac,
+		IMSI:                      imsi,
+		UserName:                  req.Username,
+		APN:                       req.APN,
+		MSISDN:                    req.MSISDN,
+		NASIP:                     req.NASIP,
+		NASIdentifier:             req.NASIdentifier,
+		CalledStationID:           req.CalledStationID,
+		CallingStationID:          coalesceString(req.CallingStationID, mac),
+		SSID:                      ssid,
+		BSSID:                     bssid,
+		AcctSessionID:             req.AcctSessionID,
+		SessionTimeoutSeconds:     ttlSeconds,
+		AuthStartTime:             now,
+		AuthExpiresAt:             now.Add(time.Duration(ttlSeconds) * time.Second),
+		LastSeenTime:              now,
+		LastAccessAcceptSessionID: sessionID,
+	})
+	if !ok {
+		return
+	}
+	s.log.Info("RADIUS authentication cache updated",
+		"mac", entry.MACAddress,
+		"imsi", entry.IMSI,
+		"apn", entry.APN,
+		"expires_at", entry.AuthExpiresAt.Format(time.RFC3339),
+		"session_timeout_seconds", entry.SessionTimeoutSeconds,
+	)
 }
 
 func (s *Service) activateAuthorizedSession(ctx context.Context, sess *session.Session, auth *aaa.AuthResult) (*AttachResponse, error) {
@@ -703,6 +778,7 @@ func (s *Service) HandleAccounting(ctx context.Context, req AccountingRequest) e
 				InputPackets:       req.InputPackets,
 				OutputPackets:      req.OutputPackets,
 			})
+			s.updateAuthCacheFromAccounting(req, sess, false)
 		}
 		s.log.Info("RADIUS Accounting-Start received",
 			"acct_session_id", req.AcctSessionID,
@@ -712,6 +788,9 @@ func (s *Service) HandleAccounting(ctx context.Context, req AccountingRequest) e
 			"nas_identifier", req.NASIdentifier,
 			"session_id", accountingSessionID(sess),
 		)
+		if sess == nil {
+			return s.handleAccountingStartWithoutSession(ctx, req)
+		}
 		return nil
 	case AccountingInterimUpdate:
 		if sess != nil {
@@ -737,6 +816,10 @@ func (s *Service) HandleAccounting(ctx context.Context, req AccountingRequest) e
 		return nil
 	case AccountingStop:
 		if sess == nil {
+			entry := s.updateAuthCacheFromAccounting(req, nil, true)
+			if entry != nil && s.cfg.Radius.Accounting.ClearAuthCacheOnStop {
+				s.sessions.DeleteAuthCache(entry.MACAddress, entry.IMSI, entry.APN)
+			}
 			s.log.Info("RADIUS Accounting-Stop received for unknown or already-cleared session",
 				"acct_session_id", req.AcctSessionID,
 				"mac", req.MACAddress,
@@ -755,6 +838,7 @@ func (s *Service) HandleAccounting(ctx context.Context, req AccountingRequest) e
 			OutputPackets:      req.OutputPackets,
 			TerminateCause:     req.TerminateCause,
 		})
+		entry := s.updateAuthCacheFromAccounting(req, sess, true)
 		s.log.Warn("RADIUS Accounting-Stop received; clearing TWAG session",
 			"acct_session_id", req.AcctSessionID,
 			"mac", req.MACAddress,
@@ -775,9 +859,11 @@ func (s *Service) HandleAccounting(ctx context.Context, req AccountingRequest) e
 			)
 		}
 		if !s.cfg.Radius.Accounting.ClearSessionOnStop {
+			s.logAccountingStopAuthCacheRetained(req, entry)
 			return nil
 		}
 		if !accountingStopShouldDetach(sess.State) {
+			s.logAccountingStopAuthCacheRetained(req, entry)
 			return nil
 		}
 		unlock, err := s.lockSubscriber(ctx, sess.IMSI, sess.MACAddress, sess.APN)
@@ -790,6 +876,11 @@ func (s *Service) HandleAccounting(ctx context.Context, req AccountingRequest) e
 			return nil
 		}
 		_, err = s.detachSessionLocked(ctx, latest)
+		if s.cfg.Radius.Accounting.ClearAuthCacheOnStop {
+			s.sessions.DeleteAuthCache(latest.MACAddress, latest.IMSI, latest.APN)
+		} else {
+			s.logAccountingStopAuthCacheRetained(req, entry)
+		}
 		return err
 	case AccountingOn:
 		s.log.Info("RADIUS Accounting-On received from NAS", "nas_ip", req.NASIP, "nas_identifier", req.NASIdentifier)
@@ -799,6 +890,390 @@ func (s *Service) HandleAccounting(ctx context.Context, req AccountingRequest) e
 		return nil
 	default:
 		return nil
+	}
+}
+
+func (s *Service) handleAccountingStartWithoutSession(ctx context.Context, req AccountingRequest) error {
+	action := s.cfg.Radius.Accounting.StartWithoutSessionAction
+	if action == "" {
+		action = "recover_if_auth_valid"
+	}
+	apn := s.cfg.Subscriber.DefaultAPN
+	if apn == "" {
+		apn = s.cfg.GTP.APN
+	}
+	now := time.Now().UTC()
+	entry, ok := s.sessions.LookupValidAuthCache(req.MACAddress, req.IMSI, apn, now)
+	if !ok && req.AcctSessionID != "" {
+		entry, ok = s.sessions.LookupValidAuthCacheByAcct(req.AcctSessionID, req.NASIP, req.NASIdentifier, now)
+	}
+	if ok && action == "recover_if_auth_valid" {
+		s.log.Info("Accounting-Start without active TWAG session; valid auth cache found, triggering recovery attach",
+			"acct_session_id", req.AcctSessionID,
+			"mac", req.MACAddress,
+			"imsi", entry.IMSI,
+			"apn", entry.APN,
+			"reason", "accounting_start_recovery",
+		)
+		resp, err := s.recoverFromAuthCache(ctx, entry, req, "accounting_start_recovery")
+		if err != nil {
+			return err
+		}
+		if resp != nil {
+			s.log.Info("Accounting-Start recovery completed",
+				"acct_session_id", req.AcctSessionID,
+				"session_id", resp.SessionID,
+				"mac", entry.MACAddress,
+				"imsi", entry.IMSI,
+				"subscriber_ip", resp.SubscriberIP,
+			)
+		}
+		return nil
+	}
+	noAuthAction := s.cfg.Radius.Accounting.StartWithoutAuthAction
+	if noAuthAction == "" {
+		noAuthAction = "disconnect"
+	}
+	if action == "disconnect" {
+		noAuthAction = "disconnect"
+	}
+	s.log.Warn("Accounting-Start without active session and without valid auth cache",
+		"acct_session_id", req.AcctSessionID,
+		"mac", req.MACAddress,
+		"user_name", req.UserName,
+		"action", noAuthAction,
+	)
+	if noAuthAction == "disconnect" {
+		s.disconnectAccountingClient(ctx, req)
+	}
+	return nil
+}
+
+func (s *Service) recoverFromAuthCache(ctx context.Context, entry *session.AuthCacheEntry, req AccountingRequest, reason string) (*AttachResponse, error) {
+	if entry == nil {
+		return nil, nil
+	}
+	if !s.beginAuthCacheRecovery(entry, reason) {
+		return nil, nil
+	}
+	defer s.finishAuthCacheRecovery(entry)
+	attachReq := AttachRequest{
+		IMSI:             entry.IMSI,
+		MSISDN:           entry.MSISDN,
+		MACAddress:       entry.MACAddress,
+		Username:         coalesceString(req.UserName, entry.UserName),
+		APN:              entry.APN,
+		CallingStationID: coalesceString(req.CallingStationID, entry.CallingStationID, entry.MACAddress),
+		CalledStationID:  coalesceString(req.CalledStationID, entry.CalledStationID),
+		NASIP:            coalesceString(req.NASIP, entry.NASIP),
+		NASIdentifier:    coalesceString(req.NASIdentifier, entry.NASIdentifier),
+		AcctSessionID:    coalesceString(req.AcctSessionID, entry.AcctSessionID),
+		ConnectInfo:      req.ConnectInfo,
+	}
+	auth := &aaa.AuthResult{
+		Allowed: true,
+		IMSI:    entry.IMSI,
+		MSISDN:  entry.MSISDN,
+		APN:     entry.APN,
+		Reason:  reason,
+	}
+	resp, err := s.AttachAuthorized(ctx, attachReq, auth)
+	if err != nil || resp == nil {
+		return resp, err
+	}
+	if req.AcctSessionID != "" {
+		_, _ = s.sessions.ApplyAccounting(resp.SessionID, session.AccountingUpdate{
+			AcctSessionID:      req.AcctSessionID,
+			AcctMultiSessionID: req.AcctMultiSessionID,
+			Active:             true,
+			LastSeen:           req.EventTimestamp,
+			InputOctets:        req.InputOctets,
+			OutputOctets:       req.OutputOctets,
+			InputPackets:       req.InputPackets,
+			OutputPackets:      req.OutputPackets,
+		})
+		s.log.Info("Accounting session bound to recovered TWAG session",
+			"acct_session_id", req.AcctSessionID,
+			"session_id", resp.SessionID,
+			"mac", entry.MACAddress,
+		)
+	}
+	return resp, nil
+}
+
+func (s *Service) beginAuthCacheRecovery(entry *session.AuthCacheEntry, state string) bool {
+	if entry == nil {
+		return false
+	}
+	cfg := s.cfg.Recovery.AccountingStartRecovery
+	if !cfg.Enabled {
+		return false
+	}
+	now := time.Now().UTC()
+	key := authCacheRecoveryKey(entry)
+	s.recoveryMu.Lock()
+	defer s.recoveryMu.Unlock()
+	rec := s.recoveryByKey[key]
+	if rec == nil {
+		rec = &authCacheRecoveryState{}
+		s.recoveryByKey[key] = rec
+	}
+	if strings.HasSuffix(rec.state, "_pending") {
+		s.log.Info("duplicate Accounting-Start recovery suppressed",
+			"mac", entry.MACAddress,
+			"imsi", entry.IMSI,
+			"state", rec.state,
+		)
+		return false
+	}
+	cooldown := time.Duration(cfg.CooldownSeconds) * time.Second
+	if !rec.lastAt.IsZero() && now.Sub(rec.lastAt) < cooldown {
+		s.log.Info("duplicate Accounting-Start recovery suppressed",
+			"mac", entry.MACAddress,
+			"imsi", entry.IMSI,
+			"state", "cooldown",
+		)
+		return false
+	}
+	cutoff := now.Add(-time.Minute)
+	filtered := rec.attempts[:0]
+	for _, at := range rec.attempts {
+		if at.After(cutoff) {
+			filtered = append(filtered, at)
+		}
+	}
+	rec.attempts = filtered
+	if len(rec.attempts) >= cfg.MaxAttemptsPerMinute {
+		s.log.Warn("Accounting-Start recovery rate limited",
+			"mac", entry.MACAddress,
+			"imsi", entry.IMSI,
+			"max_attempts_per_minute", cfg.MaxAttemptsPerMinute,
+		)
+		return false
+	}
+	rec.attempts = append(rec.attempts, now)
+	rec.state = state + "_pending"
+	rec.lastAt = now
+	return true
+}
+
+func (s *Service) finishAuthCacheRecovery(entry *session.AuthCacheEntry) {
+	if entry == nil {
+		return
+	}
+	key := authCacheRecoveryKey(entry)
+	s.recoveryMu.Lock()
+	defer s.recoveryMu.Unlock()
+	if rec := s.recoveryByKey[key]; rec != nil {
+		rec.state = "cooldown"
+		rec.lastAt = time.Now().UTC()
+	}
+}
+
+func authCacheRecoveryKey(entry *session.AuthCacheEntry) string {
+	if entry == nil {
+		return ""
+	}
+	return normalizeMAC(entry.MACAddress) + "|" + entry.IMSI + "|" + strings.ToLower(entry.APN)
+}
+
+func sessionIMSI(sess *session.Session) string {
+	if sess == nil {
+		return ""
+	}
+	return sess.IMSI
+}
+
+func sessionMSISDN(sess *session.Session) string {
+	if sess == nil {
+		return ""
+	}
+	return sess.MSISDN
+}
+
+func sessionMAC(sess *session.Session) string {
+	if sess == nil {
+		return ""
+	}
+	return sess.MACAddress
+}
+
+func sessionAPN(sess *session.Session) string {
+	if sess == nil {
+		return ""
+	}
+	return sess.APN
+}
+
+func sessionUsername(sess *session.Session) string {
+	if sess == nil {
+		return ""
+	}
+	return sess.Username
+}
+
+func sessionNASIP(sess *session.Session) string {
+	if sess == nil {
+		return ""
+	}
+	return sess.NASIP
+}
+
+func sessionNASIdentifier(sess *session.Session) string {
+	if sess == nil {
+		return ""
+	}
+	return sess.NASIdentifier
+}
+
+func sessionCalledStationID(sess *session.Session) string {
+	if sess == nil {
+		return ""
+	}
+	return sess.CalledStationID
+}
+
+func sessionCallingStationID(sess *session.Session) string {
+	if sess == nil {
+		return ""
+	}
+	return sess.CallingStationID
+}
+
+func authEntryUserName(entry *session.AuthCacheEntry) string {
+	if entry == nil {
+		return ""
+	}
+	return entry.UserName
+}
+
+func authEntryAcctSessionID(entry *session.AuthCacheEntry) string {
+	if entry == nil {
+		return ""
+	}
+	return entry.AcctSessionID
+}
+
+func (s *Service) updateAuthCacheFromAccounting(req AccountingRequest, sess *session.Session, stopped bool) *session.AuthCacheEntry {
+	if !s.cfg.Radius.AuthCache.Enabled {
+		return nil
+	}
+	imsi := coalesceString(req.IMSI, sessionIMSI(sess))
+	mac := coalesceString(req.MACAddress, sessionMAC(sess))
+	apn := coalesceString(sessionAPN(sess), s.cfg.Subscriber.DefaultAPN, s.cfg.GTP.APN)
+	if imsi == "" || mac == "" {
+		if req.AcctSessionID != "" {
+			if entry, ok := s.sessions.LookupValidAuthCacheByAcct(req.AcctSessionID, req.NASIP, req.NASIdentifier, time.Now().UTC()); ok {
+				imsi = entry.IMSI
+				mac = entry.MACAddress
+				apn = entry.APN
+			}
+		}
+	}
+	if imsi == "" || mac == "" {
+		return nil
+	}
+	now := time.Now().UTC()
+	entry, _ := s.sessions.LookupValidAuthCache(mac, imsi, apn, now)
+	if entry == nil && sess == nil {
+		return nil
+	}
+	update := session.AuthCacheUpdate{
+		MACAddress:       mac,
+		IMSI:             imsi,
+		UserName:         coalesceString(req.UserName, authEntryUserName(entry), sessionUsername(sess)),
+		APN:              apn,
+		MSISDN:           sessionMSISDN(sess),
+		NASIP:            coalesceString(req.NASIP, sessionNASIP(sess)),
+		NASIdentifier:    coalesceString(req.NASIdentifier, sessionNASIdentifier(sess)),
+		CalledStationID:  coalesceString(req.CalledStationID, sessionCalledStationID(sess)),
+		CallingStationID: coalesceString(req.CallingStationID, sessionCallingStationID(sess), mac),
+		AcctSessionID:    coalesceString(req.AcctSessionID, authEntryAcctSessionID(entry)),
+		LastSeenTime:     req.EventTimestamp,
+	}
+	if entry != nil {
+		update.SessionTimeoutSeconds = entry.SessionTimeoutSeconds
+		update.AuthStartTime = entry.AuthStartTime
+		update.AuthExpiresAt = entry.AuthExpiresAt
+		update.LastAccessAcceptSessionID = entry.LastAccessAcceptSessionID
+	} else if sess != nil {
+		update.AuthStartTime = sess.CreatedAt
+		update.AuthExpiresAt = sess.ExpiresAt
+		if !sess.ExpiresAt.IsZero() && sess.ExpiresAt.After(sess.CreatedAt) {
+			update.SessionTimeoutSeconds = int(sess.ExpiresAt.Sub(sess.CreatedAt).Seconds())
+		}
+	}
+	if update.AuthStartTime.IsZero() {
+		update.AuthStartTime = now
+	}
+	if update.SessionTimeoutSeconds <= 0 {
+		update.SessionTimeoutSeconds = s.cfg.Radius.AuthCache.DefaultTTLSeconds
+	}
+	if update.SessionTimeoutSeconds <= 0 {
+		update.SessionTimeoutSeconds = s.cfg.Radius.AccessAccept.SessionTimeoutSeconds
+	}
+	if update.SessionTimeoutSeconds <= 0 {
+		update.SessionTimeoutSeconds = 3600
+	}
+	if max := s.cfg.Radius.AuthCache.MaxTTLSeconds; max > 0 && update.SessionTimeoutSeconds > max {
+		update.SessionTimeoutSeconds = max
+	}
+	if update.AuthExpiresAt.IsZero() {
+		update.AuthExpiresAt = update.AuthStartTime.Add(time.Duration(update.SessionTimeoutSeconds) * time.Second)
+	}
+	if stopped {
+		update.LastAccountingStopAt = req.EventTimestamp
+		update.LastAccountingStopCause = req.TerminateCause
+	}
+	updated, ok := s.sessions.UpsertAuthCache(update)
+	if !ok {
+		return nil
+	}
+	return updated
+}
+
+func (s *Service) logAccountingStopAuthCacheRetained(req AccountingRequest, entry *session.AuthCacheEntry) {
+	if entry == nil {
+		return
+	}
+	s.log.Info("RADIUS Accounting-Stop processed; active session cleared but auth cache retained",
+		"mac", entry.MACAddress,
+		"imsi", entry.IMSI,
+		"auth_cache_valid", time.Now().UTC().Before(entry.AuthExpiresAt),
+		"auth_expires_at", entry.AuthExpiresAt.Format(time.RFC3339),
+		"acct_session_id", req.AcctSessionID,
+	)
+}
+
+func (s *Service) disconnectAccountingClient(ctx context.Context, req AccountingRequest) {
+	if s.dynamicAuthorizer == nil {
+		return
+	}
+	t := &session.RecoveryTombstone{
+		IMSI:             req.IMSI,
+		APN:              coalesceString(s.cfg.Subscriber.DefaultAPN, s.cfg.GTP.APN),
+		OriginalUsername: req.UserName,
+		NASIP:            req.NASIP,
+		NASIdentifier:    req.NASIdentifier,
+		AcctSessionID:    req.AcctSessionID,
+		CallingStationID: req.CallingStationID,
+		CalledStationID:  req.CalledStationID,
+		Class:            append([]byte(nil), req.Class...),
+		Reason:           "Accounting-Start without valid auth cache",
+		State:            session.RecoveryRequired,
+		CreatedAt:        time.Now().UTC(),
+	}
+	if req.MACAddress != "" {
+		if mac, err := net.ParseMAC(req.MACAddress); err == nil {
+			t.MAC = append(net.HardwareAddr(nil), mac...)
+		}
+	}
+	if err := s.dynamicAuthorizer.DisconnectOrCoA(ctx, t); err != nil {
+		s.log.Warn("RADIUS dynamic authorization for unauthorized Accounting-Start failed",
+			"acct_session_id", req.AcctSessionID,
+			"mac", req.MACAddress,
+			"error", err,
+		)
 	}
 }
 
@@ -1062,6 +1537,38 @@ func (s *Service) HandleAAAInitiatedDisconnect(ctx context.Context, imsi, sessio
 	}
 	_, err := s.detachSessionLocked(ctx, sess)
 	return err
+}
+
+func (s *Service) HandleDHCPAuthCacheRecovery(ctx context.Context, mac string) {
+	apn := coalesceString(s.cfg.Subscriber.DefaultAPN, s.cfg.GTP.APN)
+	entry, ok := s.sessions.LookupValidAuthCache(mac, "", apn, time.Now().UTC())
+	if !ok {
+		return
+	}
+	s.log.Info("DHCP from authenticated client without active session; triggering auth-cache recovery",
+		"mac", entry.MACAddress,
+		"imsi", entry.IMSI,
+		"reason", "dhcp_auth_cache_recovery",
+	)
+	req := AccountingRequest{
+		StatusType:       AccountingStart,
+		UserName:         entry.UserName,
+		IMSI:             entry.IMSI,
+		MACAddress:       entry.MACAddress,
+		CallingStationID: entry.CallingStationID,
+		CalledStationID:  entry.CalledStationID,
+		NASIP:            entry.NASIP,
+		NASIdentifier:    entry.NASIdentifier,
+		AcctSessionID:    entry.AcctSessionID,
+		EventTimestamp:   time.Now().UTC(),
+	}
+	if _, err := s.recoverFromAuthCache(ctx, entry, req, "dhcp_auth_cache_recovery"); err != nil {
+		s.log.Warn("DHCP auth-cache recovery failed",
+			"mac", entry.MACAddress,
+			"imsi", entry.IMSI,
+			"error", err,
+		)
+	}
 }
 
 func (s *Service) RecoverFromTombstone(ctx context.Context, t *session.RecoveryTombstone) (*AttachResponse, error) {
@@ -1535,6 +2042,23 @@ func normalizeMAC(mac string) string {
 		return strings.ToLower(hw.String())
 	}
 	return strings.ToLower(strings.TrimSpace(mac))
+}
+
+func splitCalledStation(value string) (string, string) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return "", ""
+	}
+	for _, sep := range []string{":", " "} {
+		parts := strings.SplitN(value, sep, 2)
+		if len(parts) != 2 {
+			continue
+		}
+		if hw, err := net.ParseMAC(parts[0]); err == nil {
+			return strings.ToLower(hw.String()), strings.TrimSpace(parts[1])
+		}
+	}
+	return "", ""
 }
 
 func shutdownShouldDetach(state session.State) bool {
