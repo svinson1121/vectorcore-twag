@@ -7,6 +7,7 @@ import (
 	"io"
 	"log/slog"
 	"net"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -21,6 +22,16 @@ type STaClient interface {
 	ExchangeEAP(ctx context.Context, req STaEAPRequest) (*STaEAPResult, error)
 	Status() STaStatus
 }
+
+type STaDisconnectEvent struct {
+	Command   string
+	SessionID string
+	UserName  string
+	IMSI      string
+	AppID     uint32
+}
+
+type STaDisconnectHandler func(context.Context, STaDisconnectEvent)
 
 type STaAuthRequest struct {
 	IMSI     string
@@ -106,6 +117,8 @@ type STaDiameterClient struct {
 
 	watchdogInterval time.Duration
 	watchdogTimeout  time.Duration
+
+	disconnectHandler STaDisconnectHandler
 }
 
 type diameterResponse struct {
@@ -129,6 +142,12 @@ func NewSTaClient(cfg config.STaConfig, log *slog.Logger) *STaDiameterClient {
 	c.nextHop.Store(uint32(time.Now().UnixNano()))
 	c.nextEnd.Store(uint32(time.Now().Unix()))
 	return c
+}
+
+func (c *STaDiameterClient) SetDisconnectHandler(handler STaDisconnectHandler) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.disconnectHandler = handler
 }
 
 func (c *STaDiameterClient) Start(ctx context.Context) error {
@@ -559,11 +578,65 @@ func (c *STaDiameterClient) handleRequest(conn net.Conn, req message) {
 			return
 		}
 		c.log.Warn("Diameter inbound request ignored", "command_code", req.CommandCode, "application_id", req.AppID)
-	case commandPPR, commandRTR:
-		c.log.Warn("STa inbound request not implemented", "command_code", req.CommandCode, "user_name", avpString(req.AVPs, avpUserName, 0))
+	case commandASR:
+		c.answerDisconnectRequest(conn, req, "ASR")
+	case commandSTR:
+		c.answerDisconnectRequest(conn, req, "STR")
 	default:
 		c.log.Warn("Diameter inbound request ignored", "command_code", req.CommandCode)
 	}
+}
+
+func (c *STaDiameterClient) answerDisconnectRequest(conn net.Conn, req message, command string) {
+	sessionID := avpString(req.AVPs, avpSessionID, 0)
+	userName := avpString(req.AVPs, avpUserName, 0)
+	imsi := imsiFromDiameterUserName(userName)
+	resultCode := uint32(2001)
+	if sessionID == "" {
+		resultCode = 5005
+	}
+	respAVPs := []avp{
+		utf8AVP(avpOriginHost, 0, c.cfg.OriginHost),
+		utf8AVP(avpOriginRealm, 0, c.cfg.OriginRealm),
+		uint32AVP(avpResultCode, 0, resultCode),
+	}
+	if sessionID != "" {
+		respAVPs = append([]avp{utf8AVP(avpSessionID, 0, sessionID)}, respAVPs...)
+	}
+	if userName != "" {
+		respAVPs = append(respAVPs, utf8AVP(avpUserName, 0, userName))
+	}
+	resp := c.newAnswer(req, respAVPs)
+	c.writeMu.Lock()
+	_, err := conn.Write(resp.encode())
+	c.writeMu.Unlock()
+	if err != nil {
+		c.log.Warn("STa disconnect answer write failed", "command", command, "session_id", sessionID, "user_name", userName, "error", err)
+		return
+	}
+	c.log.Warn("AAA-initiated STa disconnect received", "command", command, "session_id", sessionID, "user_name", userName, "imsi", imsi, "diameter_result_code", resultCode)
+	if resultCode != 2001 {
+		return
+	}
+	c.mu.RLock()
+	handler := c.disconnectHandler
+	ctx := c.ctx
+	c.mu.RUnlock()
+	if handler == nil {
+		c.log.Warn("STa disconnect received without lifecycle handler", "command", command, "session_id", sessionID, "user_name", userName, "imsi", imsi)
+		return
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	event := STaDisconnectEvent{
+		Command:   command,
+		SessionID: sessionID,
+		UserName:  userName,
+		IMSI:      imsi,
+		AppID:     req.AppID,
+	}
+	go handler(ctx, event)
 }
 
 func (c *STaDiameterClient) answerMalformedDER(conn net.Conn, req message) {
@@ -581,6 +654,33 @@ func (c *STaDiameterClient) answerMalformedDER(conn net.Conn, req message) {
 	_, _ = conn.Write(resp.encode())
 	c.writeMu.Unlock()
 	c.log.Warn("STa inbound DER missing mandatory AVP", "user_name", avpString(req.AVPs, avpUserName, 0), "missing_avp", avpEAPPayload, "diameter_result_code", 5005)
+}
+
+func imsiFromDiameterUserName(username string) string {
+	local := username
+	if at := strings.IndexByte(local, '@'); at >= 0 {
+		local = local[:at]
+	}
+	local = strings.TrimSpace(local)
+	if len(local) > 1 && (local[0] == '0' || local[0] == '6') && looksLikeDiameterIMSI(local[1:]) {
+		return local[1:]
+	}
+	if looksLikeDiameterIMSI(local) {
+		return local
+	}
+	return ""
+}
+
+func looksLikeDiameterIMSI(s string) bool {
+	if len(s) < 5 || len(s) > 15 {
+		return false
+	}
+	for _, r := range s {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 func (c *STaDiameterClient) watchdogLoop(conn net.Conn) {

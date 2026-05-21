@@ -31,10 +31,23 @@ radius:
   listen_addr: 0.0.0.0:1812
   secret: testing123
   vlan_id: 10
+  allowed_source_subnets:
+    - 192.168.105.0/24
   access_accept:
     session_timeout_seconds: 3600
     termination_action: radius_request
     idle_timeout_seconds: 0
+  accounting:
+    enabled: true
+    listen_addr: 0.0.0.0:1813
+    secret: testing123
+    clear_session_on_stop: true
+    interim_update_liveness: true
+    accounting_off_action: mark_at_risk
+  dynamic_authorization:
+    default_port: 3799
+    secret: testing123
+    prefer_discovered_nas: true
 
 aaa:
   sta:
@@ -88,6 +101,8 @@ session_recovery:
     timeout_seconds: 3
     retries: 2
     request_type: disconnect
+    wait_for_accounting_stop: true
+    accounting_stop_timeout_seconds: 10
     fallback_to_recovery_tombstone: true
 
 session_lifecycle:
@@ -95,6 +110,10 @@ session_lifecycle:
   duplicate_attach_cleanup_timeout_seconds: 5
   suppress_duplicate_create_session: true
   per_subscriber_lock_timeout_seconds: 10
+  post_activation_validation:
+    enabled: true
+    fail_action: trigger_recovery
+    first_packet_timeout_seconds: 0
 
 routing:
   enable_ip_forwarding: true

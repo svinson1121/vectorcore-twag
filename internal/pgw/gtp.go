@@ -29,6 +29,10 @@ func (c *GTPClient) StartEchoWatchdog(ctx context.Context) {
 	c.inner.StartEchoWatchdog(ctx)
 }
 
+func (c *GTPClient) SetNetworkDeleteHandler(handler func(context.Context, uint32)) {
+	c.inner.SetNetworkDeleteHandler(handler)
+}
+
 func (c *GTPClient) CreateSession(ctx context.Context, sess *session.Session) (*CreateSessionResult, error) {
 	result, err := c.inner.CreateSession(ctx, sess)
 	if err != nil {

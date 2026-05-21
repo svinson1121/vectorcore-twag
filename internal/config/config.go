@@ -83,17 +83,35 @@ type ForwardingConfig struct {
 }
 
 type RadiusConfig struct {
-	Enabled      bool                     `yaml:"enabled"`
-	ListenAddr   string                   `yaml:"listen_addr"`
-	Secret       string                   `yaml:"secret"`
-	VLANID       int                      `yaml:"vlan_id"`
-	AccessAccept RadiusAccessAcceptConfig `yaml:"access_accept"`
+	Enabled              bool                       `yaml:"enabled"`
+	ListenAddr           string                     `yaml:"listen_addr"`
+	Secret               string                     `yaml:"secret"`
+	VLANID               int                        `yaml:"vlan_id"`
+	AllowedSourceSubnets []string                   `yaml:"allowed_source_subnets"`
+	AccessAccept         RadiusAccessAcceptConfig   `yaml:"access_accept"`
+	Accounting           RadiusAccountingConfig     `yaml:"accounting"`
+	DynamicAuthorization DynamicAuthorizationConfig `yaml:"dynamic_authorization"`
 }
 
 type RadiusAccessAcceptConfig struct {
 	SessionTimeoutSeconds int    `yaml:"session_timeout_seconds"`
 	TerminationAction     string `yaml:"termination_action"`
 	IdleTimeoutSeconds    int    `yaml:"idle_timeout_seconds"`
+}
+
+type RadiusAccountingConfig struct {
+	Enabled               bool   `yaml:"enabled"`
+	ListenAddr            string `yaml:"listen_addr"`
+	Secret                string `yaml:"secret"`
+	ClearSessionOnStop    bool   `yaml:"clear_session_on_stop"`
+	InterimUpdateLiveness bool   `yaml:"interim_update_liveness"`
+	AccountingOffAction   string `yaml:"accounting_off_action"`
+}
+
+type DynamicAuthorizationConfig struct {
+	DefaultPort         int    `yaml:"default_port"`
+	Secret              string `yaml:"secret"`
+	PreferDiscoveredNAS bool   `yaml:"prefer_discovered_nas"`
 }
 
 type AAAConfig struct {
@@ -190,20 +208,29 @@ type RecoveryConfig struct {
 }
 
 type RadiusDisconnectConfig struct {
-	Enabled                     bool   `yaml:"enabled"`
-	NASPort                     int    `yaml:"nas_port"`
-	Secret                      string `yaml:"secret"`
-	TimeoutSeconds              int    `yaml:"timeout_seconds"`
-	Retries                     int    `yaml:"retries"`
-	RequestType                 string `yaml:"request_type"`
-	FallbackToRecoveryTombstone bool   `yaml:"fallback_to_recovery_tombstone"`
+	Enabled                      bool   `yaml:"enabled"`
+	NASPort                      int    `yaml:"nas_port"`
+	Secret                       string `yaml:"secret"`
+	TimeoutSeconds               int    `yaml:"timeout_seconds"`
+	Retries                      int    `yaml:"retries"`
+	RequestType                  string `yaml:"request_type"`
+	WaitForAccountingStop        bool   `yaml:"wait_for_accounting_stop"`
+	AccountingStopTimeoutSeconds int    `yaml:"accounting_stop_timeout_seconds"`
+	FallbackToRecoveryTombstone  bool   `yaml:"fallback_to_recovery_tombstone"`
 }
 
 type LifecycleConfig struct {
-	DuplicateAttachPolicy                string `yaml:"duplicate_attach_policy"`
-	DuplicateAttachCleanupTimeoutSeconds int    `yaml:"duplicate_attach_cleanup_timeout_seconds"`
-	SuppressDuplicateCreateSession       bool   `yaml:"suppress_duplicate_create_session"`
-	PerSubscriberLockTimeoutSeconds      int    `yaml:"per_subscriber_lock_timeout_seconds"`
+	DuplicateAttachPolicy                string                         `yaml:"duplicate_attach_policy"`
+	DuplicateAttachCleanupTimeoutSeconds int                            `yaml:"duplicate_attach_cleanup_timeout_seconds"`
+	SuppressDuplicateCreateSession       bool                           `yaml:"suppress_duplicate_create_session"`
+	PerSubscriberLockTimeoutSeconds      int                            `yaml:"per_subscriber_lock_timeout_seconds"`
+	PostActivationValidation             PostActivationValidationConfig `yaml:"post_activation_validation"`
+}
+
+type PostActivationValidationConfig struct {
+	Enabled                   bool   `yaml:"enabled"`
+	FailAction                string `yaml:"fail_action"`
+	FirstPacketTimeoutSeconds int    `yaml:"first_packet_timeout_seconds"`
 }
 
 type UserPlaneConfig struct {
@@ -260,7 +287,12 @@ func Default() *Config {
 				RequireAuthorizedSession: true,
 			},
 		},
-		Radius: RadiusConfig{Enabled: true, AccessAccept: RadiusAccessAcceptConfig{SessionTimeoutSeconds: 3600, TerminationAction: "radius_request"}},
+		Radius: RadiusConfig{
+			Enabled:              true,
+			AccessAccept:         RadiusAccessAcceptConfig{SessionTimeoutSeconds: 3600, TerminationAction: "radius_request"},
+			Accounting:           RadiusAccountingConfig{ListenAddr: "0.0.0.0:1813", ClearSessionOnStop: true, InterimUpdateLiveness: true, AccountingOffAction: "mark_at_risk"},
+			DynamicAuthorization: DynamicAuthorizationConfig{DefaultPort: 3799, PreferDiscoveredNAS: true},
+		},
 		AAA: AAAConfig{
 			STa: STaConfig{
 				VendorID:          STaVendorID,
@@ -268,8 +300,8 @@ func Default() *Config {
 			},
 		},
 		GTP:       GTPConfig{ChargingCharacteristics: "0800", KernelInterface: "gtp0", ControlEcho: GTPEchoConfig{Enabled: true, IntervalSeconds: MinGTPEchoIntervalSeconds, TimeoutSeconds: 5, MaxFailures: 3, StartupProbe: true}, UserEcho: GTPUserEchoConfig{Mode: "kernel_netlink", IntervalSeconds: MinGTPEchoIntervalSeconds, TimeoutSeconds: 5, MaxFailures: 3}},
-		Recovery:  RecoveryConfig{Enabled: true, ReasonGTPUError: true, RecoveryWindowSeconds: 60, StaleClientGraceSeconds: 10, CleanupOnDuplicateAttach: true, AllowSameMACReattach: true, RejectOldDHCPIP: true, DHCPStaleRequestAction: "nak", RadiusDisconnect: RadiusDisconnectConfig{NASPort: 3799, TimeoutSeconds: 3, Retries: 2, RequestType: "disconnect", FallbackToRecoveryTombstone: true}},
-		Lifecycle: LifecycleConfig{DuplicateAttachPolicy: "reuse_existing", DuplicateAttachCleanupTimeoutSeconds: 5, SuppressDuplicateCreateSession: true, PerSubscriberLockTimeoutSeconds: 10},
+		Recovery:  RecoveryConfig{Enabled: true, ReasonGTPUError: true, RecoveryWindowSeconds: 60, StaleClientGraceSeconds: 10, CleanupOnDuplicateAttach: true, AllowSameMACReattach: true, RejectOldDHCPIP: true, DHCPStaleRequestAction: "nak", RadiusDisconnect: RadiusDisconnectConfig{NASPort: 3799, TimeoutSeconds: 3, Retries: 2, RequestType: "disconnect", AccountingStopTimeoutSeconds: 10, FallbackToRecoveryTombstone: true}},
+		Lifecycle: LifecycleConfig{DuplicateAttachPolicy: "reuse_existing", DuplicateAttachCleanupTimeoutSeconds: 5, SuppressDuplicateCreateSession: true, PerSubscriberLockTimeoutSeconds: 10, PostActivationValidation: PostActivationValidationConfig{Enabled: true, FailAction: "trigger_recovery"}},
 		Routing:   RoutingConfig{InstallRoutes: true},
 	}
 }
@@ -313,12 +345,33 @@ func (c *Config) ApplyDefaults() {
 	if c.Radius.VLANID == 0 {
 		c.Radius.VLANID = 10
 	}
+	if len(c.Radius.AllowedSourceSubnets) == 0 {
+		c.warn("RADIUS allowed_source_subnets is empty; accepting RADIUS from any source")
+	}
 	if c.Radius.AccessAccept.SessionTimeoutSeconds == 0 {
 		c.Radius.AccessAccept.SessionTimeoutSeconds = 3600
 	}
 	if c.Radius.AccessAccept.TerminationAction == "" {
 		c.Radius.AccessAccept.TerminationAction = "radius_request"
 	}
+	if c.Radius.Accounting.ListenAddr == "" {
+		c.Radius.Accounting.ListenAddr = "0.0.0.0:1813"
+	}
+	if c.Radius.Accounting.Secret == "" {
+		c.Radius.Accounting.Secret = c.Radius.Secret
+	}
+	c.Radius.Accounting.ClearSessionOnStop = true
+	c.Radius.Accounting.InterimUpdateLiveness = true
+	if c.Radius.Accounting.AccountingOffAction == "" {
+		c.Radius.Accounting.AccountingOffAction = "mark_at_risk"
+	}
+	if c.Radius.DynamicAuthorization.DefaultPort == 0 {
+		c.Radius.DynamicAuthorization.DefaultPort = 3799
+	}
+	if c.Radius.DynamicAuthorization.Secret == "" {
+		c.Radius.DynamicAuthorization.Secret = c.Radius.Secret
+	}
+	c.Radius.DynamicAuthorization.PreferDiscoveredNAS = true
 	if c.GTP.ChargingCharacteristics == "" {
 		c.GTP.ChargingCharacteristics = "0800"
 	}
@@ -363,6 +416,12 @@ func (c *Config) ApplyDefaults() {
 	if c.Recovery.RadiusDisconnect.RequestType == "" {
 		c.Recovery.RadiusDisconnect.RequestType = "disconnect"
 	}
+	if c.Radius.Accounting.Enabled {
+		c.Recovery.RadiusDisconnect.WaitForAccountingStop = true
+	}
+	if c.Recovery.RadiusDisconnect.AccountingStopTimeoutSeconds == 0 {
+		c.Recovery.RadiusDisconnect.AccountingStopTimeoutSeconds = 10
+	}
 	c.Recovery.RadiusDisconnect.FallbackToRecoveryTombstone = true
 	if c.Lifecycle.DuplicateAttachPolicy == "" {
 		c.Lifecycle.DuplicateAttachPolicy = "reuse_existing"
@@ -372,6 +431,10 @@ func (c *Config) ApplyDefaults() {
 	}
 	if c.Lifecycle.PerSubscriberLockTimeoutSeconds == 0 {
 		c.Lifecycle.PerSubscriberLockTimeoutSeconds = 10
+	}
+	c.Lifecycle.PostActivationValidation.Enabled = true
+	if c.Lifecycle.PostActivationValidation.FailAction == "" {
+		c.Lifecycle.PostActivationValidation.FailAction = "trigger_recovery"
 	}
 	c.Routing.InstallRoutes = true
 	if c.Routing.PolicyRouting {
@@ -493,6 +556,27 @@ func (c *Config) Validate() error {
 	if c.Radius.AccessAccept.IdleTimeoutSeconds < 0 {
 		errs = append(errs, "radius.access_accept.idle_timeout_seconds must be greater than or equal to 0")
 	}
+	for i, cidr := range c.Radius.AllowedSourceSubnets {
+		if _, _, err := net.ParseCIDR(cidr); err != nil {
+			errs = append(errs, fmt.Sprintf("radius.allowed_source_subnets[%d] must be a valid CIDR", i))
+		}
+	}
+	if c.Radius.Accounting.Enabled {
+		if c.Radius.Accounting.ListenAddr == "" {
+			errs = append(errs, "radius.accounting.listen_addr is required when accounting.enabled is true")
+		}
+		if c.Radius.Accounting.Secret == "" {
+			errs = append(errs, "radius.accounting.secret is required when accounting.enabled is true")
+		}
+	}
+	switch c.Radius.Accounting.AccountingOffAction {
+	case "mark_at_risk", "clear_sessions", "ignore":
+	default:
+		errs = append(errs, "radius.accounting.accounting_off_action must be mark_at_risk, clear_sessions, or ignore")
+	}
+	if c.Radius.DynamicAuthorization.DefaultPort < 0 || c.Radius.DynamicAuthorization.DefaultPort > 65535 {
+		errs = append(errs, "radius.dynamic_authorization.default_port must be between 0 and 65535")
+	}
 	errs = append(errs, validateSTa(c.AAA.STa)...)
 	errs = append(errs, validateRequiredIP("gtp.local_gtpc_ip", c.GTP.LocalGTPCIP)...)
 	errs = append(errs, validateRequiredIP("gtp.local_gtpu_ip", c.GTP.LocalGTPUIP)...)
@@ -544,6 +628,9 @@ func (c *Config) Validate() error {
 	if c.Recovery.RadiusDisconnect.NASPort <= 0 || c.Recovery.RadiusDisconnect.NASPort > 65535 {
 		errs = append(errs, "session_recovery.radius_disconnect.nas_port must be between 1 and 65535")
 	}
+	if c.Recovery.RadiusDisconnect.AccountingStopTimeoutSeconds <= 0 {
+		errs = append(errs, "session_recovery.radius_disconnect.accounting_stop_timeout_seconds must be greater than 0")
+	}
 	if c.Recovery.RadiusDisconnect.TimeoutSeconds <= 0 {
 		errs = append(errs, "session_recovery.radius_disconnect.timeout_seconds must be greater than 0")
 	}
@@ -561,6 +648,14 @@ func (c *Config) Validate() error {
 	}
 	if c.Lifecycle.PerSubscriberLockTimeoutSeconds <= 0 {
 		errs = append(errs, "session_lifecycle.per_subscriber_lock_timeout_seconds must be greater than 0")
+	}
+	switch c.Lifecycle.PostActivationValidation.FailAction {
+	case "trigger_recovery", "reject_access", "log_only":
+	default:
+		errs = append(errs, "session_lifecycle.post_activation_validation.fail_action must be trigger_recovery, reject_access, or log_only")
+	}
+	if c.Lifecycle.PostActivationValidation.FirstPacketTimeoutSeconds < 0 {
+		errs = append(errs, "session_lifecycle.post_activation_validation.first_packet_timeout_seconds must be greater than or equal to 0")
 	}
 	if c.Routing.PolicyRouting {
 		if c.Routing.PolicyTable <= 0 {

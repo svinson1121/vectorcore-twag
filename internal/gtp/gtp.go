@@ -50,6 +50,7 @@ type GTPClient struct {
 	lastEchoFailure         time.Time
 	lastEchoLatency         time.Duration
 	echoWatchdogStarted     atomic.Bool
+	networkDeleteHandler    func(context.Context, uint32)
 }
 
 type CreateSessionResult struct {
@@ -313,6 +314,10 @@ func (c *GTPClient) StartEchoWatchdog(ctx context.Context) {
 	}()
 }
 
+func (c *GTPClient) SetNetworkDeleteHandler(handler func(context.Context, uint32)) {
+	c.networkDeleteHandler = handler
+}
+
 func (c *GTPClient) PeerHealth() PeerHealthStatus {
 	c.healthMu.RLock()
 	defer c.healthMu.RUnlock()
@@ -568,6 +573,10 @@ func (c *GTPClient) handleIncomingGTPv2(packet []byte, peer *net.UDPAddr) {
 		c.handleInboundEchoRequest(msg, peer)
 		return
 	}
+	if msg.Type == gtpv2DeleteSessionReq {
+		c.handleInboundDeleteSessionRequest(msg, peer)
+		return
+	}
 
 	tx, pendingCount, pendingSeq, pendingOp := c.lookupTransaction(msg.Sequence)
 	if tx == nil {
@@ -641,6 +650,34 @@ func (c *GTPClient) handleInboundEchoRequest(msg gtpv2Message, peer *net.UDPAddr
 		"remote_port", peer.Port,
 		"sequence", msg.Sequence,
 	)
+}
+
+func (c *GTPClient) handleInboundDeleteSessionRequest(msg gtpv2Message, peer *net.UDPAddr) {
+	c.log.Warn("PGW-initiated bearer/session deletion received",
+		"remote_ip", peer.IP.String(),
+		"remote_port", peer.Port,
+		"gtpc_teid", msg.TEID,
+		"action", "cleanup_and_radius_disconnect",
+	)
+	resp := gtpv2Message{
+		Type:     gtpv2DeleteSessionResp,
+		HasTEID:  true,
+		TEID:     msg.TEID,
+		Sequence: msg.Sequence,
+		Payload:  gtpv2IE{Type: ieCause, Payload: []byte{causeRequestAccepted, 0}}.encode(),
+	}
+	encoded, err := resp.encode()
+	if err != nil {
+		c.log.Warn("GTP-C Delete Session Response encode failed", "remote_ip", peer.IP.String(), "remote_port", peer.Port, "sequence", msg.Sequence, "error", err)
+		return
+	}
+	if _, err := c.conn.WriteToUDP(encoded, peer); err != nil {
+		c.log.Warn("GTP-C Delete Session Response send failed", "remote_ip", peer.IP.String(), "remote_port", peer.Port, "sequence", msg.Sequence, "error", err)
+		return
+	}
+	if c.networkDeleteHandler != nil {
+		go c.networkDeleteHandler(context.Background(), msg.TEID)
+	}
 }
 
 func (c *GTPClient) lookupTransaction(sequence uint32) (*gtpcTransaction, int, uint32, string) {

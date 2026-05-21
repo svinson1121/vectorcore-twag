@@ -18,6 +18,7 @@ var ErrNotImplemented = errors.New("pgw client not implemented")
 type Client interface {
 	Probe(ctx context.Context) error
 	StartEchoWatchdog(ctx context.Context)
+	SetNetworkDeleteHandler(handler func(context.Context, uint32))
 	CreateSession(ctx context.Context, sess *session.Session) (*CreateSessionResult, error)
 	DeleteSession(ctx context.Context, sess *session.Session) error
 	Close() error

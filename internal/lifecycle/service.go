@@ -97,6 +97,43 @@ type EAPResponse struct {
 	MSK          []byte `json:"-"`
 }
 
+type AccountingStatus string
+
+const (
+	AccountingStart         AccountingStatus = "Start"
+	AccountingStop          AccountingStatus = "Stop"
+	AccountingInterimUpdate AccountingStatus = "Interim-Update"
+	AccountingOn            AccountingStatus = "Accounting-On"
+	AccountingOff           AccountingStatus = "Accounting-Off"
+)
+
+type AccountingRequest struct {
+	StatusType         AccountingStatus
+	UserName           string
+	IMSI               string
+	MACAddress         string
+	CallingStationID   string
+	CalledStationID    string
+	NASIP              string
+	NASIdentifier      string
+	NASPort            uint32
+	NASPortType        string
+	AcctSessionID      string
+	AcctMultiSessionID string
+	AcctAuthentic      string
+	AcctSessionTime    uint32
+	InputOctets        uint64
+	OutputOctets       uint64
+	InputPackets       uint64
+	OutputPackets      uint64
+	TerminateCause     string
+	FramedIPAddress    net.IP
+	Class              []byte
+	EventTimestamp     time.Time
+	ConnectInfo        string
+	SourceIP           string
+}
+
 type Service struct {
 	cfg               *config.Config
 	aaa               aaa.Provider
@@ -583,8 +620,55 @@ func (s *Service) activateAuthorizedSession(ctx context.Context, sess *session.S
 			return responseFromSession(failed), err
 		}
 	}
+	if err := s.validatePostActivation(ctx, active); err != nil {
+		s.log.Warn("post-activation datapath validation failed",
+			"session_id", active.ID,
+			"subscriber_ip", ipString(active.SubscriberIP),
+			"failed_check", err.Error(),
+			"action", s.cfg.Lifecycle.PostActivationValidation.FailAction,
+		)
+		switch s.cfg.Lifecycle.PostActivationValidation.FailAction {
+		case "log_only":
+		case "trigger_recovery", "reject_access":
+			_, _ = s.detachSessionLocked(ctx, active)
+			return responseFromSession(active), err
+		}
+	} else if s.cfg.Lifecycle.PostActivationValidation.Enabled {
+		s.log.Info("post-activation datapath validation succeeded",
+			"session_id", active.ID,
+			"subscriber_ip", ipString(active.SubscriberIP),
+		)
+	}
 	s.log.Info("session active", sessionLogAttrs(active)...)
 	return responseFromSession(active), nil
+}
+
+func (s *Service) validatePostActivation(ctx context.Context, sess *session.Session) error {
+	if !s.cfg.Lifecycle.PostActivationValidation.Enabled {
+		return nil
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if sess == nil {
+		return fmt.Errorf("session_missing")
+	}
+	if sess.SubscriberIP == nil {
+		return fmt.Errorf("subscriber_ip_missing")
+	}
+	if sess.GTPCTEID == 0 {
+		return fmt.Errorf("gtpc_teid_missing")
+	}
+	if sess.LocalGTPUTEID == 0 {
+		return fmt.Errorf("local_gtpu_teid_missing")
+	}
+	if sess.RemoteGTPUTEID == 0 {
+		return fmt.Errorf("remote_gtpu_teid_missing")
+	}
+	if sess.Authorized != true {
+		return fmt.Errorf("access_authorization_missing")
+	}
+	return nil
 }
 
 func (s *Service) Detach(ctx context.Context, req DetachRequest) (*DetachResponse, error) {
@@ -600,6 +684,156 @@ func (s *Service) Detach(ctx context.Context, req DetachRequest) (*DetachRespons
 	return s.detachSessionLocked(ctx, sess)
 }
 
+func (s *Service) HandleAccounting(ctx context.Context, req AccountingRequest) error {
+	now := time.Now().UTC()
+	if req.EventTimestamp.IsZero() {
+		req.EventTimestamp = now
+	}
+	sess := s.findAccountingSession(req)
+	switch req.StatusType {
+	case AccountingStart:
+		if sess != nil {
+			_, _ = s.sessions.ApplyAccounting(sess.ID, session.AccountingUpdate{
+				AcctSessionID:      req.AcctSessionID,
+				AcctMultiSessionID: req.AcctMultiSessionID,
+				Active:             true,
+				LastSeen:           req.EventTimestamp,
+				InputOctets:        req.InputOctets,
+				OutputOctets:       req.OutputOctets,
+				InputPackets:       req.InputPackets,
+				OutputPackets:      req.OutputPackets,
+			})
+		}
+		s.log.Info("RADIUS Accounting-Start received",
+			"acct_session_id", req.AcctSessionID,
+			"mac", req.MACAddress,
+			"user_name", req.UserName,
+			"nas_ip", req.NASIP,
+			"nas_identifier", req.NASIdentifier,
+			"session_id", accountingSessionID(sess),
+		)
+		return nil
+	case AccountingInterimUpdate:
+		if sess != nil {
+			_, _ = s.sessions.ApplyAccounting(sess.ID, session.AccountingUpdate{
+				AcctSessionID:      req.AcctSessionID,
+				AcctMultiSessionID: req.AcctMultiSessionID,
+				Active:             true,
+				LastSeen:           req.EventTimestamp,
+				InputOctets:        req.InputOctets,
+				OutputOctets:       req.OutputOctets,
+				InputPackets:       req.InputPackets,
+				OutputPackets:      req.OutputPackets,
+			})
+		}
+		s.log.Info("RADIUS Accounting-Interim-Update received",
+			"acct_session_id", req.AcctSessionID,
+			"mac", req.MACAddress,
+			"session_time", req.AcctSessionTime,
+			"input_octets", req.InputOctets,
+			"output_octets", req.OutputOctets,
+			"session_id", accountingSessionID(sess),
+		)
+		return nil
+	case AccountingStop:
+		if sess == nil {
+			s.log.Info("RADIUS Accounting-Stop received for unknown or already-cleared session",
+				"acct_session_id", req.AcctSessionID,
+				"mac", req.MACAddress,
+				"nas_ip", req.NASIP,
+			)
+			return nil
+		}
+		_, _ = s.sessions.ApplyAccounting(sess.ID, session.AccountingUpdate{
+			AcctSessionID:      req.AcctSessionID,
+			AcctMultiSessionID: req.AcctMultiSessionID,
+			Active:             false,
+			LastSeen:           req.EventTimestamp,
+			InputOctets:        req.InputOctets,
+			OutputOctets:       req.OutputOctets,
+			InputPackets:       req.InputPackets,
+			OutputPackets:      req.OutputPackets,
+			TerminateCause:     req.TerminateCause,
+		})
+		s.log.Warn("RADIUS Accounting-Stop received; clearing TWAG session",
+			"acct_session_id", req.AcctSessionID,
+			"mac", req.MACAddress,
+			"terminate_cause", req.TerminateCause,
+			"session_id", sess.ID,
+			"action", "cleanup_session",
+		)
+		if t, ok := s.sessions.UpdateRecovery(sess.ID, func(t *session.RecoveryTombstone) {
+			if t.State == session.RecoveryWaitingAccountingStop {
+				t.State = session.RecoveryWaitingReauth
+				t.LastAction = "accounting_stop_received"
+			}
+		}); ok && t.LastAction == "accounting_stop_received" {
+			s.log.Info("Accounting-Stop completed RADIUS Disconnect lifecycle",
+				"session_id", sess.ID,
+				"acct_session_id", req.AcctSessionID,
+				"recovery_state", t.State,
+			)
+		}
+		if !s.cfg.Radius.Accounting.ClearSessionOnStop {
+			return nil
+		}
+		if !accountingStopShouldDetach(sess.State) {
+			return nil
+		}
+		unlock, err := s.lockSubscriber(ctx, sess.IMSI, sess.MACAddress, sess.APN)
+		if err != nil {
+			return err
+		}
+		defer unlock()
+		latest, ok := s.sessions.Get(sess.ID)
+		if !ok || !accountingStopShouldDetach(latest.State) {
+			return nil
+		}
+		_, err = s.detachSessionLocked(ctx, latest)
+		return err
+	case AccountingOn:
+		s.log.Info("RADIUS Accounting-On received from NAS", "nas_ip", req.NASIP, "nas_identifier", req.NASIdentifier)
+		return nil
+	case AccountingOff:
+		s.log.Warn("RADIUS Accounting-Off received from NAS", "nas_ip", req.NASIP, "nas_identifier", req.NASIdentifier, "action", s.cfg.Radius.Accounting.AccountingOffAction)
+		return nil
+	default:
+		return nil
+	}
+}
+
+func (s *Service) findAccountingSession(req AccountingRequest) *session.Session {
+	if len(req.Class) > 0 {
+		if sess, ok := s.sessions.LookupByClass(req.Class); ok {
+			return sess
+		}
+	}
+	if req.AcctSessionID != "" {
+		if sess, ok := s.sessions.LookupByAcctSession(req.AcctSessionID, req.NASIP, req.NASIdentifier); ok {
+			return sess
+		}
+	}
+	if req.MACAddress != "" {
+		for _, sess := range s.sessions.FindByMAC(req.MACAddress) {
+			if req.NASIP != "" && sess.NASIP != "" && sess.NASIP != req.NASIP {
+				continue
+			}
+			return sess
+		}
+	}
+	if req.IMSI != "" {
+		if sess, ok := s.sessions.LookupByIMSI(req.IMSI); ok {
+			return sess
+		}
+	}
+	if req.FramedIPAddress != nil {
+		if sess, ok := s.sessions.LookupByIP(req.FramedIPAddress); ok {
+			return sess
+		}
+	}
+	return nil
+}
+
 func (s *Service) detachSessionLocked(ctx context.Context, sess *session.Session) (*DetachResponse, error) {
 	terminating, err := s.sessions.MarkTerminating(sess.ID)
 	if err != nil {
@@ -607,7 +841,15 @@ func (s *Service) detachSessionLocked(ctx context.Context, sess *session.Session
 	}
 	var errs []error
 	if err := s.pgw.DeleteSession(ctx, terminating); err != nil {
-		errs = append(errs, err)
+		if nonFatalPGWDeleteError(err) {
+			s.log.Warn("PGW Delete Session failed/non-fatal; continuing local cleanup",
+				"session_id", terminating.ID,
+				"error", err.Error(),
+				"action", "continue_local_cleanup",
+			)
+		} else {
+			errs = append(errs, err)
+		}
 	}
 	if err := s.routing.Remove(terminating); err != nil {
 		errs = append(errs, err)
@@ -632,6 +874,29 @@ func (s *Service) detachSessionLocked(ctx context.Context, sess *session.Session
 		s.log.Info("session terminated", sessionLogAttrs(terminated)...)
 	}
 	return detachResponseFromSession(terminated), errors.Join(errs...)
+}
+
+func nonFatalPGWDeleteError(err error) bool {
+	if err == nil {
+		return false
+	}
+	return pgw.IsContextNotFound(err) || errors.Is(err, context.DeadlineExceeded)
+}
+
+func accountingSessionID(sess *session.Session) string {
+	if sess == nil {
+		return ""
+	}
+	return sess.ID
+}
+
+func accountingStopShouldDetach(state session.State) bool {
+	switch state {
+	case session.Pending, session.AuthPending, session.Authorized, session.IPAllocated, session.PGWPending, session.Active, session.Recovering:
+		return true
+	default:
+		return false
+	}
 }
 
 func (s *Service) HandleGTPUErrorIndication(ctx context.Context, ind gtpu.ErrorIndication) error {
@@ -739,6 +1004,66 @@ func (s *Service) HandleGTPUErrorIndication(ctx context.Context, ind gtpu.ErrorI
 	return nil
 }
 
+func (s *Service) HandlePGWInitiatedDelete(ctx context.Context, gtpcTEID uint32) {
+	sess, ok := s.sessions.LookupByTEID(gtpcTEID)
+	if !ok {
+		s.log.Warn("PGW-initiated bearer/session deletion received for unknown session",
+			"gtpc_teid", fmt.Sprintf("0x%08x", gtpcTEID),
+			"action", "log_only",
+		)
+		return
+	}
+	s.log.Warn("PGW-initiated bearer/session deletion received",
+		"session_id", sess.ID,
+		"imsi", sess.IMSI,
+		"subscriber_ip", ipString(sess.SubscriberIP),
+		"action", "cleanup_and_radius_disconnect",
+	)
+	if sess.State != session.Active {
+		return
+	}
+	reason := "PGW-initiated bearer/session deletion"
+	recovering, err := s.sessions.MarkRecovering(sess.ID, reason)
+	if err == nil && recovering != nil {
+		sess = recovering
+	}
+	if s.cfg.Recovery.Enabled {
+		if tombstone, ok := s.sessions.AddRecoveryTombstone(sess, reason, s.recoveryTombstoneTTL(sess)); ok {
+			s.attemptDynamicAuthorization(ctx, tombstone)
+		}
+	}
+	_, _ = s.detachSessionLocked(ctx, sess)
+}
+
+func (s *Service) HandleAAAInitiatedDisconnect(ctx context.Context, imsi, sessionID string) error {
+	var sess *session.Session
+	if sessionID != "" {
+		if found, ok := s.sessions.Get(sessionID); ok {
+			sess = found
+		}
+	}
+	if sess == nil && imsi != "" {
+		if found, ok := s.sessions.LookupByIMSI(imsi); ok {
+			sess = found
+		}
+	}
+	if sess == nil {
+		return nil
+	}
+	s.log.Warn("AAA-initiated session disconnect received",
+		"session_id", sess.ID,
+		"imsi", sess.IMSI,
+		"action", "detach_and_radius_disconnect",
+	)
+	if s.cfg.Recovery.Enabled {
+		if tombstone, ok := s.sessions.AddRecoveryTombstone(sess, "AAA-initiated session disconnect", s.recoveryTombstoneTTL(sess)); ok {
+			s.attemptDynamicAuthorization(ctx, tombstone)
+		}
+	}
+	_, err := s.detachSessionLocked(ctx, sess)
+	return err
+}
+
 func (s *Service) RecoverFromTombstone(ctx context.Context, t *session.RecoveryTombstone) (*AttachResponse, error) {
 	if t == nil {
 		return nil, fmt.Errorf("recovery tombstone is required")
@@ -834,11 +1159,26 @@ func (s *Service) attemptDynamicAuthorization(ctx context.Context, tombstone *se
 		s.setRecoveryFallback(tombstone, "dynamic_authorization_failed", err.Error())
 		return
 	}
+	nextState := session.RecoveryWaitingReauth
+	nextAction := "dynamic_authorization_accepted"
+	if s.cfg.Recovery.RadiusDisconnect.WaitForAccountingStop {
+		nextState = session.RecoveryWaitingAccountingStop
+		nextAction = "waiting_accounting_stop"
+	}
 	s.sessions.UpdateRecovery(tombstone.OldSessionID, func(t *session.RecoveryTombstone) {
-		t.State = session.RecoveryWaitingReauth
-		t.LastAction = "dynamic_authorization_accepted"
+		t.State = nextState
+		t.LastAction = nextAction
 		t.LastError = ""
 	})
+	if nextState == session.RecoveryWaitingAccountingStop {
+		s.log.Info("RADIUS Disconnect acknowledged; waiting for Accounting-Stop",
+			"session_id", tombstone.OldSessionID,
+			"acct_session_id", tombstone.AcctSessionID,
+			"timeout_seconds", s.cfg.Recovery.RadiusDisconnect.AccountingStopTimeoutSeconds,
+		)
+		go s.waitForAccountingStopTimeout(tombstone.OldSessionID, time.Duration(s.cfg.Recovery.RadiusDisconnect.AccountingStopTimeoutSeconds)*time.Second)
+		return
+	}
 	s.log.Info("RADIUS dynamic authorization accepted; waiting for UE reauth",
 		"old_session_id", tombstone.OldSessionID,
 		"imsi", tombstone.IMSI,
@@ -846,6 +1186,26 @@ func (s *Service) attemptDynamicAuthorization(ctx context.Context, tombstone *se
 		"old_subscriber_ip", ipString(tombstone.OldSubscriberIP),
 		"recovery_state", session.RecoveryWaitingReauth,
 	)
+}
+
+func (s *Service) waitForAccountingStopTimeout(oldSessionID string, timeout time.Duration) {
+	if timeout <= 0 {
+		timeout = 10 * time.Second
+	}
+	<-time.After(timeout)
+	t, ok := s.sessions.UpdateRecovery(oldSessionID, func(t *session.RecoveryTombstone) {
+		if t.State == session.RecoveryWaitingAccountingStop {
+			t.State = session.RecoveryFallback
+			t.LastAction = "accounting_stop_timeout"
+		}
+	})
+	if ok && t.State == session.RecoveryFallback && t.LastAction == "accounting_stop_timeout" {
+		s.log.Warn("Accounting-Stop wait timed out after RADIUS Disconnect ACK",
+			"session_id", oldSessionID,
+			"acct_session_id", t.AcctSessionID,
+			"action", "fallback_tombstone",
+		)
+	}
 }
 
 func (s *Service) setRecoveryFallback(tombstone *session.RecoveryTombstone, action, lastError string) {

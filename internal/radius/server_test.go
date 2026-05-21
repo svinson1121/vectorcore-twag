@@ -47,6 +47,39 @@ func TestEAPRequestUsesConfiguredDefaultsAndRadiusIdentity(t *testing.T) {
 	}
 }
 
+func TestAccountingRequestParsesSessionAttributes(t *testing.T) {
+	s := New(config.RadiusConfig{}, config.SubscriberConfig{}, nil, slog.New(slog.DiscardHandler))
+	p := radiustransport.New(radiustransport.CodeAccountingRequest, []byte("secret"))
+	_ = rfc2865.UserName_SetString(p, "0311435000070570@wlan.mnc435.mcc311.3gppnetwork.org")
+	_ = rfc2865.CallingStationID_SetString(p, "AA-BB-CC-DD-EE-01")
+	_ = rfc2865.NASIPAddress_Set(p, net.ParseIP("192.168.105.71"))
+	_ = rfc2865.NASIdentifier_SetString(p, "ap-1")
+	_ = rfc2866.AcctSessionID_SetString(p, "acct-1")
+	_ = rfc2866.AcctStatusType_Set(p, rfc2866.AcctStatusType_Value_Stop)
+	_ = rfc2866.AcctTerminateCause_Set(p, rfc2866.AcctTerminateCause_Value_UserRequest)
+	_ = rfc2866.AcctInputOctets_Set(p, 123)
+	req := s.accountingRequest(p, &net.UDPAddr{IP: net.ParseIP("192.168.105.71"), Port: 1813})
+	if req.StatusType != lifecycle.AccountingStop {
+		t.Fatalf("status = %q", req.StatusType)
+	}
+	if req.IMSI != "311435000070570" || req.MACAddress != "aa:bb:cc:dd:ee:01" || req.AcctSessionID != "acct-1" {
+		t.Fatalf("unexpected accounting request: %+v", req)
+	}
+	if req.TerminateCause != "User-Request" || req.InputOctets != 123 {
+		t.Fatalf("unexpected accounting counters/cause: %+v", req)
+	}
+}
+
+func TestRadiusSourceAllowList(t *testing.T) {
+	s := New(config.RadiusConfig{AllowedSourceSubnets: []string{"192.168.105.0/24"}}, config.SubscriberConfig{}, nil, slog.New(slog.DiscardHandler))
+	if !s.sourceAllowed(&net.UDPAddr{IP: net.ParseIP("192.168.105.71"), Port: 1812}) {
+		t.Fatal("expected allowed source")
+	}
+	if s.sourceAllowed(&net.UDPAddr{IP: net.ParseIP("203.0.113.50"), Port: 1812}) {
+		t.Fatal("expected source to be rejected")
+	}
+}
+
 func TestEAPRequestParsesPrefixed3GPPNAIIMSI(t *testing.T) {
 	s := New(config.RadiusConfig{}, config.SubscriberConfig{
 		DefaultAPN:   "internet",

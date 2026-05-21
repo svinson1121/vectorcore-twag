@@ -326,6 +326,38 @@ func (m *Manager) LookupByIP(ip net.IP) (*Session, bool) {
 	return clone(s), ok
 }
 
+func (m *Manager) LookupByAcctSession(acctSessionID, nasIP, nasIdentifier string) (*Session, bool) {
+	if acctSessionID == "" {
+		return nil, false
+	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	for _, s := range m.byID {
+		if s.AcctSessionID != acctSessionID {
+			continue
+		}
+		if nasIP != "" && s.NASIP != "" && s.NASIP != nasIP {
+			continue
+		}
+		if nasIdentifier != "" && s.NASIdentifier != "" && s.NASIdentifier != nasIdentifier {
+			continue
+		}
+		return clone(s), true
+	}
+	return nil, false
+}
+
+func (m *Manager) LookupByClass(class []byte) (*Session, bool) {
+	if len(class) == 0 {
+		return nil, false
+	}
+	id := string(class)
+	if s, ok := m.Get(id); ok {
+		return s, true
+	}
+	return nil, false
+}
+
 func (m *Manager) LookupByTEID(teid uint32) (*Session, bool) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
@@ -361,6 +393,50 @@ func (m *Manager) RecordGTPUError(id string, teid uint32, at time.Time) (*Sessio
 		s.LastGTPUErrorAt = at
 		s.LastGTPUErrorTEID = teid
 		s.Reason = fmt.Sprintf("GTP-U Error Indication for TEID 0x%08x", teid)
+	})
+}
+
+type AccountingUpdate struct {
+	AcctSessionID      string
+	AcctMultiSessionID string
+	Active             bool
+	AtRisk             bool
+	LastSeen           time.Time
+	InputOctets        uint64
+	OutputOctets       uint64
+	InputPackets       uint64
+	OutputPackets      uint64
+	TerminateCause     string
+}
+
+func (m *Manager) ApplyAccounting(id string, update AccountingUpdate) (*Session, error) {
+	return m.update(id, func(s *Session) {
+		if update.AcctSessionID != "" {
+			s.AcctSessionID = update.AcctSessionID
+		}
+		if update.AcctMultiSessionID != "" {
+			s.AcctMultiSessionID = update.AcctMultiSessionID
+		}
+		s.AccountingActive = update.Active
+		s.AccountingAtRisk = update.AtRisk
+		if !update.LastSeen.IsZero() {
+			s.LastAccountingAt = update.LastSeen
+		}
+		if update.InputOctets != 0 {
+			s.AcctInputOctets = update.InputOctets
+		}
+		if update.OutputOctets != 0 {
+			s.AcctOutputOctets = update.OutputOctets
+		}
+		if update.InputPackets != 0 {
+			s.AcctInputPackets = update.InputPackets
+		}
+		if update.OutputPackets != 0 {
+			s.AcctOutputPackets = update.OutputPackets
+		}
+		if update.TerminateCause != "" {
+			s.AcctTerminateCause = update.TerminateCause
+		}
 	})
 }
 

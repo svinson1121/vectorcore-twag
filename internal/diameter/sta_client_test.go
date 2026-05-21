@@ -136,6 +136,100 @@ func TestSTaClientAnswersDERMissingEAPPayload(t *testing.T) {
 	}
 }
 
+func TestSTaClientAnswersASRAndNotifiesHandler(t *testing.T) {
+	clientSide, serverSide := net.Pipe()
+	defer clientSide.Close() //nolint:errcheck
+	defer serverSide.Close() //nolint:errcheck
+
+	client := NewSTaClient(testSTaConfig("127.0.0.1:3868"), slog.New(slog.DiscardHandler))
+	events := make(chan STaDisconnectEvent, 1)
+	client.SetDisconnectHandler(func(_ context.Context, event STaDisconnectEvent) {
+		events <- event
+	})
+	req := message{
+		Flags:       flagRequest | flagProxiable,
+		CommandCode: commandASR,
+		AppID:       config.STaAuthApplicationID,
+		HopByHop:    11,
+		EndToEnd:    21,
+		AVPs: []avp{
+			utf8AVP(avpSessionID, 0, "aaa.ims.example;asr;1"),
+			utf8AVP(avpUserName, 0, "0311435000070571@wlan.mnc435.mcc311.3gppnetwork.org"),
+			utf8AVP(avpOriginHost, 0, "aaa.ims.example"),
+			utf8AVP(avpOriginRealm, 0, "ims.example"),
+		},
+	}
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		client.handleRequest(serverSide, req)
+	}()
+
+	resp, err := decodeMessage(clientSide)
+	if err != nil {
+		t.Fatalf("decode ASA: %v", err)
+	}
+	<-done
+	if resp.CommandCode != commandASR || resp.isRequest() || resp.AppID != config.STaAuthApplicationID {
+		t.Fatalf("unexpected ASA header command=%d request=%t app_id=%d", resp.CommandCode, resp.isRequest(), resp.AppID)
+	}
+	assertAVPUint32(t, resp.AVPs, avpResultCode, 0, 2001)
+	assertAVPString(t, resp.AVPs, avpSessionID, 0, "aaa.ims.example;asr;1")
+	assertAVPString(t, resp.AVPs, avpUserName, 0, "0311435000070571@wlan.mnc435.mcc311.3gppnetwork.org")
+
+	select {
+	case event := <-events:
+		if event.Command != "ASR" || event.SessionID != "aaa.ims.example;asr;1" || event.IMSI != "311435000070571" {
+			t.Fatalf("unexpected disconnect event %#v", event)
+		}
+	case <-time.After(time.Second):
+		t.Fatalf("timed out waiting for disconnect event")
+	}
+}
+
+func TestSTaClientRejectsASRWithoutSessionID(t *testing.T) {
+	clientSide, serverSide := net.Pipe()
+	defer clientSide.Close() //nolint:errcheck
+	defer serverSide.Close() //nolint:errcheck
+
+	client := NewSTaClient(testSTaConfig("127.0.0.1:3868"), slog.New(slog.DiscardHandler))
+	events := make(chan STaDisconnectEvent, 1)
+	client.SetDisconnectHandler(func(_ context.Context, event STaDisconnectEvent) {
+		events <- event
+	})
+	req := message{
+		Flags:       flagRequest | flagProxiable,
+		CommandCode: commandASR,
+		AppID:       config.STaAuthApplicationID,
+		HopByHop:    12,
+		EndToEnd:    22,
+		AVPs: []avp{
+			utf8AVP(avpUserName, 0, "311435000070571"),
+			utf8AVP(avpOriginHost, 0, "aaa.ims.example"),
+			utf8AVP(avpOriginRealm, 0, "ims.example"),
+		},
+	}
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		client.handleRequest(serverSide, req)
+	}()
+
+	resp, err := decodeMessage(clientSide)
+	if err != nil {
+		t.Fatalf("decode ASA: %v", err)
+	}
+	<-done
+	assertAVPUint32(t, resp.AVPs, avpResultCode, 0, 5005)
+	select {
+	case event := <-events:
+		t.Fatalf("unexpected disconnect event %#v", event)
+	default:
+	}
+}
+
 func TestSTaClientRejectsNonSuccessResult(t *testing.T) {
 	addr, done := startTestSTaPeer(t, 5001)
 	client := NewSTaClient(testSTaConfig(addr), slog.New(slog.DiscardHandler))

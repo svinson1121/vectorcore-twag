@@ -28,19 +28,32 @@ type EAPService interface {
 	ExchangeEAP(ctx context.Context, req lifecycle.EAPRequest) (*lifecycle.EAPResponse, error)
 }
 
+type AccountingService interface {
+	HandleAccounting(ctx context.Context, req lifecycle.AccountingRequest) error
+}
+
 type Server struct {
-	cfg    config.RadiusConfig
-	sub    config.SubscriberConfig
-	eap    EAPService
-	log    *slog.Logger
-	server *radiustransport.PacketServer
+	cfg              config.RadiusConfig
+	sub              config.SubscriberConfig
+	eap              EAPService
+	accounting       AccountingService
+	log              *slog.Logger
+	server           *radiustransport.PacketServer
+	accountingServer *radiustransport.PacketServer
+	allowedSources   []*net.IPNet
+	registry         *APRegistry
 }
 
 func New(cfg config.RadiusConfig, sub config.SubscriberConfig, eap EAPService, logger *slog.Logger) *Server {
 	if cfg.VLANID == 0 {
 		cfg.VLANID = radiusDefaultVLANID
 	}
-	return &Server{cfg: cfg, sub: sub, eap: eap, log: logger}
+	s := &Server{cfg: cfg, sub: sub, eap: eap, log: logger, registry: NewAPRegistry(logger)}
+	if accounting, ok := eap.(AccountingService); ok {
+		s.accounting = accounting
+	}
+	s.allowedSources = parseAllowedSources(cfg.AllowedSourceSubnets, logger)
+	return s
 }
 
 func (s *Server) Start(ctx context.Context) error {
@@ -55,6 +68,9 @@ func (s *Server) Start(ctx context.Context) error {
 	}
 	if s.cfg.Secret == "" {
 		return fmt.Errorf("radius secret is required")
+	}
+	if len(s.allowedSources) == 0 {
+		s.log.Warn("RADIUS allowed_source_subnets is empty; accepting RADIUS from any source", "severity", "warning")
 	}
 	s.server = &radiustransport.PacketServer{
 		Addr:         s.cfg.ListenAddr,
@@ -81,30 +97,81 @@ func (s *Server) Start(ctx context.Context) error {
 		_ = s.Stop(context.Background())
 		return ctx.Err()
 	}
+	if s.cfg.Accounting.Enabled {
+		if s.accounting == nil {
+			return fmt.Errorf("radius accounting service is required")
+		}
+		s.accountingServer = &radiustransport.PacketServer{
+			Addr:         s.cfg.Accounting.ListenAddr,
+			SecretSource: radiustransport.StaticSecretSource([]byte(s.cfg.Accounting.Secret)),
+			Handler:      radiustransport.HandlerFunc(s.handleAccounting),
+			ErrorLog:     log.New(radiusLogWriter{s.log}, "", 0),
+		}
+		acctErrCh := make(chan error, 1)
+		go func() {
+			err := s.accountingServer.ListenAndServe()
+			if errors.Is(err, radiustransport.ErrServerShutdown) {
+				err = nil
+			}
+			acctErrCh <- err
+		}()
+		select {
+		case err := <-acctErrCh:
+			if err != nil {
+				return fmt.Errorf("start radius accounting server: %w", err)
+			}
+		case <-time.After(50 * time.Millisecond):
+			s.log.Info("RADIUS accounting server started", "listen_addr", s.cfg.Accounting.ListenAddr)
+		case <-ctx.Done():
+			_ = s.Stop(context.Background())
+			return ctx.Err()
+		}
+	}
 	return nil
 }
 
 func (s *Server) Stop(ctx context.Context) error {
 	if s.server == nil {
-		return nil
+		if s.accountingServer == nil {
+			return nil
+		}
 	}
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	if err := s.server.Shutdown(ctx); err != nil {
-		return err
+	if s.server != nil {
+		if err := s.server.Shutdown(ctx); err != nil {
+			return err
+		}
+		s.log.Info("RADIUS server stopped", "listen_addr", s.cfg.ListenAddr)
 	}
-	s.log.Info("RADIUS server stopped", "listen_addr", s.cfg.ListenAddr)
+	if s.accountingServer != nil {
+		if err := s.accountingServer.Shutdown(ctx); err != nil {
+			return err
+		}
+		s.log.Info("RADIUS accounting server stopped", "listen_addr", s.cfg.Accounting.ListenAddr)
+	}
 	return nil
 }
 
 func (s *Server) handle(w radiustransport.ResponseWriter, r *radiustransport.Request) {
+	if !s.sourceAllowed(r.RemoteAddr) {
+		s.log.Warn("RADIUS packet dropped from unauthorized source", "source_ip", radiusSourceIP(r.RemoteAddr), "allowed_source_subnets", s.cfg.AllowedSourceSubnets)
+		return
+	}
 	if r.Code != radiustransport.CodeAccessRequest {
 		s.log.Warn("RADIUS request rejected", "remote_addr", r.RemoteAddr.String(), "code", r.Code.String(), "reason", "unsupported packet type")
 		_ = w.Write(r.Response(radiustransport.CodeAccessReject))
 		return
 	}
 	req := s.eapRequest(r.Packet, r.RemoteAddr)
+	s.registry.Update(APObservation{
+		SourceIP:         radiusSourceIP(r.RemoteAddr),
+		NASIP:            req.NASIP,
+		NASIdentifier:    req.NASIdentifier,
+		CalledStationID:  req.CalledStationID,
+		AccountingPacket: false,
+	})
 	eapInfo := describeEAP(req.EAPPayload)
 	s.log.Info("RADIUS Access-Request received",
 		"remote_addr", r.RemoteAddr.String(),
@@ -234,6 +301,102 @@ func (s *Server) handle(w radiustransport.ResponseWriter, r *radiustransport.Req
 		"has_message_authenticator", hasMessageAuthenticator(accept),
 	)
 	_ = w.Write(accept)
+}
+
+func (s *Server) handleAccounting(w radiustransport.ResponseWriter, r *radiustransport.Request) {
+	if !s.sourceAllowed(r.RemoteAddr) {
+		s.log.Warn("RADIUS packet dropped from unauthorized source", "source_ip", radiusSourceIP(r.RemoteAddr), "allowed_source_subnets", s.cfg.AllowedSourceSubnets)
+		return
+	}
+	if r.Code != radiustransport.CodeAccountingRequest {
+		s.log.Warn("RADIUS accounting request rejected", "remote_addr", r.RemoteAddr.String(), "code", r.Code.String(), "reason", "unsupported packet type")
+		return
+	}
+	req := s.accountingRequest(r.Packet, r.RemoteAddr)
+	s.registry.Update(APObservation{
+		SourceIP:         radiusSourceIP(r.RemoteAddr),
+		NASIP:            req.NASIP,
+		NASIdentifier:    req.NASIdentifier,
+		CalledStationID:  req.CalledStationID,
+		AccountingPacket: true,
+	})
+	ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
+	defer cancel()
+	if s.accounting != nil {
+		if err := s.accounting.HandleAccounting(ctx, req); err != nil {
+			s.log.Warn("RADIUS accounting lifecycle handling failed",
+				"remote_addr", r.RemoteAddr.String(),
+				"acct_status_type", req.StatusType,
+				"acct_session_id", req.AcctSessionID,
+				"error", err,
+			)
+		}
+	}
+	_ = w.Write(r.Response(radiustransport.CodeAccountingResponse))
+}
+
+func (s *Server) accountingRequest(packet *radiustransport.Packet, remoteAddr net.Addr) lifecycle.AccountingRequest {
+	status := rfc2866.AcctStatusType_Get(packet)
+	username := rfc2865.UserName_GetString(packet)
+	nasIP := ""
+	if ip := rfc2865.NASIPAddress_Get(packet); ip != nil && ip.To4() != nil {
+		nasIP = ip.String()
+	}
+	if nasIP == "" {
+		nasIP = radiusSourceIP(remoteAddr)
+	}
+	framed := rfc2865.FramedIPAddress_Get(packet)
+	if framed != nil && framed.Equal(net.IPv4zero) {
+		framed = nil
+	}
+	eventTimestamp := rfc2869.EventTimestamp_Get(packet)
+	return lifecycle.AccountingRequest{
+		StatusType:         accountingStatus(status),
+		UserName:           username,
+		IMSI:               imsiFromNAI(username),
+		MACAddress:         normalizeMAC(rfc2865.CallingStationID_GetString(packet)),
+		CallingStationID:   rfc2865.CallingStationID_GetString(packet),
+		CalledStationID:    rfc2865.CalledStationID_GetString(packet),
+		NASIP:              nasIP,
+		NASIdentifier:      rfc2865.NASIdentifier_GetString(packet),
+		NASPort:            uint32(rfc2865.NASPort_Get(packet)),
+		NASPortType:        rfc2865.NASPortType_Get(packet).String(),
+		AcctSessionID:      rfc2866.AcctSessionID_GetString(packet),
+		AcctMultiSessionID: rfc2866.AcctMultiSessionID_GetString(packet),
+		AcctAuthentic:      rfc2866.AcctAuthentic_Get(packet).String(),
+		AcctSessionTime:    uint32(rfc2866.AcctSessionTime_Get(packet)),
+		InputOctets:        acctCounter(uint64(rfc2866.AcctInputOctets_Get(packet)), uint64(rfc2869.AcctInputGigawords_Get(packet))),
+		OutputOctets:       acctCounter(uint64(rfc2866.AcctOutputOctets_Get(packet)), uint64(rfc2869.AcctOutputGigawords_Get(packet))),
+		InputPackets:       uint64(rfc2866.AcctInputPackets_Get(packet)),
+		OutputPackets:      uint64(rfc2866.AcctOutputPackets_Get(packet)),
+		TerminateCause:     rfc2866.AcctTerminateCause_Get(packet).String(),
+		FramedIPAddress:    framed,
+		Class:              append([]byte(nil), rfc2865.Class_Get(packet)...),
+		EventTimestamp:     eventTimestamp,
+		ConnectInfo:        rfc2869.ConnectInfo_GetString(packet),
+		SourceIP:           radiusSourceIP(remoteAddr),
+	}
+}
+
+func accountingStatus(status rfc2866.AcctStatusType) lifecycle.AccountingStatus {
+	switch status {
+	case rfc2866.AcctStatusType_Value_Start:
+		return lifecycle.AccountingStart
+	case rfc2866.AcctStatusType_Value_Stop:
+		return lifecycle.AccountingStop
+	case rfc2866.AcctStatusType_Value_InterimUpdate:
+		return lifecycle.AccountingInterimUpdate
+	case rfc2866.AcctStatusType_Value_AccountingOn:
+		return lifecycle.AccountingOn
+	case rfc2866.AcctStatusType_Value_AccountingOff:
+		return lifecycle.AccountingOff
+	default:
+		return lifecycle.AccountingStatus(status.String())
+	}
+}
+
+func acctCounter(octets, gigawords uint64) uint64 {
+	return (gigawords << 32) | octets
 }
 
 func (s *Server) addAccessAcceptLifetime(packet *radiustransport.Packet) error {
@@ -445,6 +608,37 @@ func radiusSourceIP(addr net.Addr) string {
 		return ""
 	}
 	return host
+}
+
+func parseAllowedSources(cidrs []string, log *slog.Logger) []*net.IPNet {
+	out := make([]*net.IPNet, 0, len(cidrs))
+	for _, cidr := range cidrs {
+		_, network, err := net.ParseCIDR(cidr)
+		if err != nil {
+			if log != nil {
+				log.Warn("invalid RADIUS allowed source subnet ignored", "subnet", cidr, "error", err)
+			}
+			continue
+		}
+		out = append(out, network)
+	}
+	return out
+}
+
+func (s *Server) sourceAllowed(addr net.Addr) bool {
+	if len(s.allowedSources) == 0 {
+		return true
+	}
+	ip := net.ParseIP(radiusSourceIP(addr))
+	if ip == nil {
+		return false
+	}
+	for _, network := range s.allowedSources {
+		if network.Contains(ip) {
+			return true
+		}
+	}
+	return false
 }
 
 func imsiFromNAI(username string) string {

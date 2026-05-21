@@ -14,6 +14,8 @@ const (
 	diameterVer   byte   = 1
 	headerLen            = 20
 	commandCER    uint32 = 257
+	commandASR    uint32 = 274
+	commandSTR    uint32 = 275
 	commandDER    uint32 = 268
 	commandDWR    uint32 = 280
 	commandDPR    uint32 = 282

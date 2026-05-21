@@ -117,6 +117,20 @@ func run(cfg *config.Config, log *slog.Logger) error {
 	pgwClient.StartEchoWatchdog(ctx)
 	routingMgr := routing.New(cfg.Routing, log)
 	lifecycleSvc := lifecycle.New(cfg, provider, sessionMgr, nil, pgwClient, routingMgr, log)
+	staClient.SetDisconnectHandler(func(ctx context.Context, ev diameter.STaDisconnectEvent) {
+		if err := lifecycleSvc.HandleAAAInitiatedDisconnect(ctx, ev.IMSI, ev.SessionID); err != nil {
+			log.Warn("AAA-initiated STa disconnect cleanup failed",
+				"command", ev.Command,
+				"session_id", ev.SessionID,
+				"user_name", ev.UserName,
+				"imsi", ev.IMSI,
+				"error", err,
+			)
+		}
+	})
+	pgwClient.SetNetworkDeleteHandler(func(ctx context.Context, gtpcTEID uint32) {
+		lifecycleSvc.HandlePGWInitiatedDelete(ctx, gtpcTEID)
+	})
 	lifecycleSvc.SetUserPlane(userPlane)
 	lifecycleSvc.SetDynamicAuthorizer(radiusserver.NewDynamicAuthorizer(cfg.Recovery.RadiusDisconnect, log))
 	userPlane.SetErrorIndicationHandler(func(ctx context.Context, ind gtpu.ErrorIndication) {

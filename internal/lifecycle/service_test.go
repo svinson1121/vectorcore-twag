@@ -106,6 +106,52 @@ func TestDetachDeletesPGWRouteAndLease(t *testing.T) {
 	}
 }
 
+func TestAccountingStopCleansUpActiveSession(t *testing.T) {
+	svc, deps := newTestService(t)
+	svc.cfg.Radius.Accounting.ClearSessionOnStop = true
+	resp, err := svc.Attach(context.Background(), AttachRequest{
+		IMSI:          "001010000000001",
+		MACAddress:    "aa:bb:cc:dd:ee:01",
+		AcctSessionID: "acct-1",
+		NASIP:         "192.168.105.71",
+	})
+	if err != nil {
+		t.Fatalf("Attach() error = %v", err)
+	}
+	err = svc.HandleAccounting(context.Background(), AccountingRequest{
+		StatusType:     AccountingStop,
+		AcctSessionID:  "acct-1",
+		MACAddress:     "aa:bb:cc:dd:ee:01",
+		NASIP:          "192.168.105.71",
+		TerminateCause: "User-Request",
+	})
+	if err != nil {
+		t.Fatalf("HandleAccounting() error = %v", err)
+	}
+	if deps.pgw.deleted != 1 {
+		t.Fatalf("pgw deletes = %d, want 1", deps.pgw.deleted)
+	}
+	if _, ok := deps.sessions.Get(resp.SessionID); ok {
+		t.Fatal("accounting stop should remove active session")
+	}
+}
+
+func TestUnknownAccountingStopIsIdempotent(t *testing.T) {
+	svc, deps := newTestService(t)
+	err := svc.HandleAccounting(context.Background(), AccountingRequest{
+		StatusType:    AccountingStop,
+		AcctSessionID: "missing",
+		MACAddress:    "aa:bb:cc:dd:ee:01",
+		NASIP:         "192.168.105.71",
+	})
+	if err != nil {
+		t.Fatalf("HandleAccounting() error = %v", err)
+	}
+	if deps.pgw.deleted != 0 {
+		t.Fatalf("pgw deletes = %d, want 0", deps.pgw.deleted)
+	}
+}
+
 func TestDuplicateAttachReusesExistingActiveSession(t *testing.T) {
 	svc, deps := newTestService(t)
 	first, err := svc.Attach(context.Background(), AttachRequest{
@@ -664,6 +710,8 @@ type fakePGW struct {
 func (f *fakePGW) Probe(context.Context) error { return nil }
 
 func (f *fakePGW) StartEchoWatchdog(context.Context) {}
+
+func (f *fakePGW) SetNetworkDeleteHandler(func(context.Context, uint32)) {}
 
 func (f *fakePGW) CreateSession(_ context.Context, sess *session.Session) (*pgw.CreateSessionResult, error) {
 	f.mu.Lock()
