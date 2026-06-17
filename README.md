@@ -45,6 +45,18 @@ Items still being hardened:
 
 ---
 
+## Related Components
+
+### 3GPP AAA Server
+
+This TWAG can use the [VectorCore AAA Server](https://github.com/svinson1121/vectorcore-aaa) as the 3GPP AAA component for non-3GPP access authentication and authorization.
+
+The AAA server provides the authentication path used by:
+
+- **TWAG** access via **STa** toward the 3GPP AAA Server
+- AAA/HSS interaction via **SWx**
+- AAA/PGW interaction via **S6b**
+
 ## Architecture
 
 ```text
